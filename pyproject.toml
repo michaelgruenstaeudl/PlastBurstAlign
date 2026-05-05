@@ -11,7 +11,7 @@ authors = [
     {name = "Gregory Smith", email = "g_smith10@mail.fhsu.edu"},
     {name = "Michael Gruenstaeudl, PhD", email = "m_gruenstaeudl@fhsu.edu"}
 ]
-version = "0.9.4"
+version = "0.9.5"
 
 requires-python = ">= 3.9"
 dependencies = [
