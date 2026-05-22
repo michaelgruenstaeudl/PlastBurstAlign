@@ -2,8 +2,8 @@
 # This file allows you to specify parameters for the tool
 
 # Input/Output directories
-in_dir: "./benchmarking/Atreace_dataset"
-out_dir: "./benchmarking/Atreace_out"
+in_dir: "./benchmarking/Asteraceae_dataset"
+out_dir: "./benchmarking/Asteraceae_out"
 
 # Selection mode: cds, int, or igs
 select_mode: "igs"
@@ -32,7 +32,6 @@ order: "seq"
 
 # Enable concatenation
 concat: false
-
 
 
 # Path to alignment tool executable (optional)

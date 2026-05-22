@@ -57,6 +57,10 @@ class ExtractAndCollect:
             f"{self.num_threads} processes"
         )
 
+        if not self.plastid_data.files:
+            log.critical("No input files found for extraction")
+            raise FileNotFoundError("No input files found for extraction")
+
         # Step 0. Extract first genome in list for feature ordering
         if self.plastid_data.order == "seq":
             first_genome = self.plastid_data.files.pop(0)
@@ -68,7 +72,7 @@ class ExtractAndCollect:
         file_lists = split_list(self.plastid_data.files, self.num_threads * 2)
 
         # Step 2. Use ProcessPoolExecutor to parallelize extraction
-        mp_context = multiprocessing.get_context("fork")  # same method on all platforms
+        mp_context = multiprocessing.get_context()
         with ProcessPoolExecutor(max_workers=self.num_threads, mp_context=mp_context) as executor:
             future_to_recs = [
                 executor.submit(self._extract_recs, file_list) for file_list in file_lists

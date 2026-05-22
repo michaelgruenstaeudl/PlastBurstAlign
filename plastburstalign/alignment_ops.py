@@ -69,8 +69,7 @@ class AlignmentCoordination:
         self._aligned_saved = False
 
         # Create the appropriate alignment tool
-        print(user_params.get("alignment_tool"))
-        tool_name = user_params.get("alignment_tool") if user_params else "mafft"
+        tool_name = (user_params or {}).get("alignment_tool", "mafft") or "mafft"
         tool_path = user_params.get("alignment_tool_path") if user_params else None
         self.aligner = get_alignment_tool(tool_name, user_params, tool_path)
         

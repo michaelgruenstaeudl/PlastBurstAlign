@@ -133,13 +133,26 @@ class UserParameters(Dict[str, Any]):
         self["min_num_taxa"] = min_num_taxa
 
     def _set_num_threads(self, num_threads: Union[str, int]):
-        if isinstance(num_threads, str) and not num_threads.isnumeric():
-            try:
-                num_threads = os.cpu_count()
-            except NotImplementedError:
-                num_threads = multiprocessing.cpu_count()
-        elif isinstance(num_threads, str):
-            num_threads = int(num_threads)
+        if isinstance(num_threads, str):
+            num_threads_clean = num_threads.strip().lower()
+            if num_threads_clean == "auto":
+                try:
+                    num_threads = os.cpu_count()
+                except NotImplementedError:
+                    num_threads = multiprocessing.cpu_count()
+            elif num_threads_clean.isnumeric():
+                num_threads = int(num_threads_clean)
+            else:
+                log.critical(f"Invalid `num_threads` value provided: {num_threads}")
+                raise ValueError
+
+        if num_threads is None:
+            num_threads = 1
+
+        self._test_type("num_threads", num_threads, int)
+        if num_threads < 1:
+            log.critical(f"Invalid `num_threads` value provided: {num_threads}")
+            raise ValueError
         self["num_threads"] = num_threads
 
     def _set_verbose(self, verbose: bool):
@@ -310,7 +323,7 @@ class UserParametersScript(UserParameters):
         parser.add_argument(
             "--numthreads",
             "-n",
-            type=int,
+            type=str,
             required=False,
             help="(Optional) Number of CPUs to use; can be any positive integer or 'auto' (default)",
         )
@@ -343,7 +356,7 @@ class UserParametersScript(UserParameters):
             type=str,
             required=False,
             default=argparse.SUPPRESS,
-            help="(Optional) Alignment tool to use (default: muscle). Options: mafft, clustal, muscle",
+            help="(Optional) Alignment tool to use (default: mafft). Options: mafft, clustal, muscle",
         )
         parser.add_argument(
             "--alignmenttoolpath",
@@ -365,6 +378,6 @@ class UserParametersScript(UserParameters):
         # and remove empty argument values (`None`)
         args_dict = vars(args)
         args_dict = {
-            cls._construct_name_map[k]: v for k, v in args_dict.items() if v
+            cls._construct_name_map[k]: v for k, v in args_dict.items() if v is not None
         }
         return args_dict

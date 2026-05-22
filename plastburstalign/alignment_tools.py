@@ -337,7 +337,11 @@ def get_alignment_tool(tool_name: str, user_params: Optional[Dict[str, Any]] = N
     Returns:
         AlignmentTool instance or None if tool is not supported
     """
-    tool_name = tool_name.lower().strip()
+    if not isinstance(tool_name, str) or not tool_name.strip():
+        log.warning("no alignment tool specified; defaulting to mafft")
+        tool_name = "mafft"
+    else:
+        tool_name = tool_name.lower().strip()
 
     if tool_name == "mafft":
         return MAFFT(user_params, tool_path)
