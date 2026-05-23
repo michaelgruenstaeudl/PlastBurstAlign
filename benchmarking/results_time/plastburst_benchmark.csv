@@ -1,2 +1,0 @@
-dataset,threads,mode,genbank_files,total_time_seconds,throughput_files_per_sec,success,error,timestamp
-benchmark_ZhangNNEtAl2025_13724angiosperms,4,cds,13724,72950.4393966198,0.18812772223872185,True,,20260218T1436
