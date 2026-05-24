@@ -108,7 +108,7 @@ plastburstalign \
 | `-s` | Sequence type to extract (e.g., cds, int, igs) | `cds` |
 | `-a` | Alignment tool to use | `mafft` |
 | `-l` | Minimum sequence length (bp); regions shorter than this are excluded| `9` |
-| `-t` | Minimum number of taxa in which a region must be present to be extracted | `3` |
+| `-t` | Minimum number of taxa (int) or relative frequency (0<value<=1) in which a region must be present to be extracted | `0.1` |
 | `-n` | Number of threads to use| `8` |
 | `--config` | Path to YAML config file containing parameters | `config.yaml` |
 
