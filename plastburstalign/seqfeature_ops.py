@@ -43,6 +43,7 @@ class PlastidData:
             os.path.join(user_params.get("in_dir"), f) for f in os.listdir(user_params.get("in_dir"))
             if f.endswith(user_params.get("fileext"))
         ]
+        self.num_taxa = len(self.files)
 
     def _set_order_fun(self, user_params: Dict[str, Any]):
         self.order = user_params.get("order")

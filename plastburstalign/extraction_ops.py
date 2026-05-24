@@ -658,9 +658,14 @@ class DataCleaning:
             log.info(
                 f"  removing excluded regions"
             )
-        log.info(
-            f"  removing annotations that occur in fewer than {self.min_num_taxa} taxa"
-        )
+        if isinstance(self.min_num_taxa, float):
+            log.info(
+                f"  removing annotations that occur in fewer than {self.min_num_taxa:.2f} of taxa"
+            )
+        else:
+            log.info(
+                f"  removing annotations that occur in fewer than {self.min_num_taxa} taxa"
+            )
         log.info(
             f"  removing annotations whose longest sequence is shorter than {self.min_seq_length} bp"
         )
@@ -676,9 +681,21 @@ class DataCleaning:
             self.plastid_data.remove_nuc(feat_name)
 
     def _remove_infreq(self, feat_name: str, rec_list: List[SeqRecord]):
-        if len(rec_list) < self.min_num_taxa:
-            log.info(f"    removing {feat_name} for not reaching the minimum number of taxa defined")
-            self.plastid_data.remove_nuc(feat_name)
+        if isinstance(self.min_num_taxa, float):
+            num_taxa = getattr(self.plastid_data, "num_taxa", None)
+            if num_taxa is None:
+                log.critical("Total number of taxa is unavailable for frequency filtering")
+                raise AttributeError
+            frequency = len(rec_list) / num_taxa
+            if frequency < self.min_num_taxa:
+                log.info(
+                    f"    removing {feat_name} for not reaching the minimum relative frequency of taxa defined"
+                )
+                self.plastid_data.remove_nuc(feat_name)
+        else:
+            if len(rec_list) < self.min_num_taxa:
+                log.info(f"    removing {feat_name} for not reaching the minimum number of taxa defined")
+                self.plastid_data.remove_nuc(feat_name)
 
     def _remove_excluded(self, feat_name: str):
         if feat_name in self.exclude_region:

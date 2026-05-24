@@ -31,7 +31,7 @@ class UserParameters(Dict[str, Any]):
             exclude_fullcds: Optional[List[str]] = None,
             exclude_region: Optional[List[str]] = None,
             min_seq_length: int = 3,
-            min_num_taxa: int = 2,
+            min_num_taxa: Union[int, float] = 0.1,
             num_threads: Union[str, int] = "auto",
             verbose: bool = False,
             order: str = "seq",
@@ -55,7 +55,7 @@ class UserParameters(Dict[str, Any]):
                 Using the parameter will lead to an exception for select mode `cds` as
                 `exclude_fullcds` should be used for that purpose.
             min_seq_length: Minimal sequence length (in bp) below which regions will not be extracted
-            min_num_taxa: Minimum number of taxa in which a region must be present to be extracted
+            min_num_taxa: Minimum number of taxa (integer) or relative frequency (0<value<=1) in which a region must be present to be extracted
             num_threads: Number of CPUs to use; can be any positive integer or 'auto'
             verbose: Enable verbose logging
             order: Order that the alignments should be saved ('seq' or 'alpha')
@@ -128,8 +128,18 @@ class UserParameters(Dict[str, Any]):
         self._test_type("min_seq_length", min_seq_length, int)
         self["min_seq_length"] = min_seq_length
 
-    def _set_min_num_taxa(self, min_num_taxa: int):
-        self._test_type("min_num_taxa", min_num_taxa, int)
+    def _set_min_num_taxa(self, min_num_taxa: Union[int, float]):
+        if isinstance(min_num_taxa, int):
+            if min_num_taxa < 1:
+                log.critical(f"Invalid `min_num_taxa` value provided: {min_num_taxa}")
+                raise ValueError
+        elif isinstance(min_num_taxa, float):
+            if min_num_taxa <= 0 or min_num_taxa > 1:
+                log.critical(f"Invalid `min_num_taxa` value provided: {min_num_taxa}")
+                raise ValueError
+        else:
+            log.critical(f"Invalid `min_num_taxa` type provided: {type(min_num_taxa)}")
+            raise TypeError
         self["min_num_taxa"] = min_num_taxa
 
     def _set_num_threads(self, num_threads: Union[str, int]):
@@ -316,9 +326,12 @@ class UserParametersScript(UserParameters):
         parser.add_argument(
             "--minnumtaxa",
             "-t",
-            type=int,
+            type=float,
             required=False,
-            help="(Optional) Minimum number of taxa in which a region must be present to be extracted",
+            help=(
+                "(Optional) Minimum number of taxa (integer) or relative frequency "
+                "(0<value<=1) in which a region must be present to be extracted"
+            ),
         )
         parser.add_argument(
             "--numthreads",
