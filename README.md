@@ -1,4 +1,4 @@
-# plastburstalign
+# PlastBurstAlign
 A Python tool to extract and align genes, introns, and intergenic spacers across thousands of plastid genomes using associative arrays
 
 ---
