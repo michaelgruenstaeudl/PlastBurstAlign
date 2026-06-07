@@ -1,9 +1,9 @@
 from .user_parameters import UserParametersScript
-from .plastome_burst_and_align import PlastomeBurstAndAlign
+from .plast_burst_align import PlastBurstAlign
 
 def main():
     params = UserParametersScript()
-    burst_align = PlastomeBurstAndAlign(params)
+    burst_align = PlastBurstAlign(params)
     burst_align.execute()
     print("\nend of script\n")
 

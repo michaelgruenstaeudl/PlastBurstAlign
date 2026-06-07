@@ -14,7 +14,7 @@ name: build-and-publish
 jobs:
   build:
     name: Build distribution 📦
-    if: github.repository == 'michaelgruenstaeudl/PlastomeBurstAndAlign'
+    if: github.repository == 'michaelgruenstaeudl/PlastBurstAlign'
     runs-on: ubuntu-latest
 
     steps:

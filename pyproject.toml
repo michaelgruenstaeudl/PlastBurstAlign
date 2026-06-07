@@ -51,4 +51,4 @@ plastburstalign = "plastburstalign.__main__:main"
 
 [project.urls]
 Homepage = "https://gruenstaeudl-lab.com/"
-Repository = "https://github.com/michaelgruenstaeudl/PlastomeBurstAndAlign"
+Repository = "https://github.com/michaelgruenstaeudl/PlastBurstAlign"
