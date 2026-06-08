@@ -266,6 +266,21 @@ class UserParametersScript(UserParameters):
             return {}
 
     @staticmethod
+    def _parse_min_num_taxa(value: str) -> Union[int, float]:
+        """Parse minnumtaxa CLI input as int when possible, otherwise float."""
+        try:
+            if value.isdigit() or (value.startswith("-") and value[1:].isdigit()):
+                return int(value)
+            parsed = float(value)
+        except ValueError:
+            raise argparse.ArgumentTypeError(
+                "--minnumtaxa must be an integer (e.g. 5) or a relative frequency (0<value<=1)"
+            )
+        if parsed.is_integer():
+            return int(parsed)
+        return parsed
+
+    @staticmethod
     def _get_parser() -> argparse.ArgumentParser:
         parser = argparse.ArgumentParser()
         parser.add_argument(
@@ -326,7 +341,7 @@ class UserParametersScript(UserParameters):
         parser.add_argument(
             "--minnumtaxa",
             "-t",
-            type=float,
+            type=UserParametersScript._parse_min_num_taxa,
             required=False,
             help=(
                 "(Optional) Minimum number of taxa (integer) or relative frequency "
