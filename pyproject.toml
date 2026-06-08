@@ -10,7 +10,7 @@ authors = [
     {name = "Thanina Hamitouche", email = "t_hamitouche@mail.fhsu.edu"},
     {name = "Michael Gruenstaeudl, PhD", email = "m_gruenstaeudl@fhsu.edu"}
 ]
-version = "0.9.7"
+version = "0.9.8"
 
 requires-python = ">=3.11"
 dependencies = [
@@ -51,4 +51,4 @@ plastburstalign = "plastburstalign.__main__:main"
 
 [project.urls]
 Homepage = "https://gruenstaeudl-lab.com/"
-Repository = "https://github.com/michaelgruenstaeudl/PlastomeBurstAndAlign"
+Repository = "https://github.com/michaelgruenstaeudl/PlastBurstAlign"

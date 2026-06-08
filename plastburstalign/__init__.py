@@ -14,7 +14,7 @@ from .user_parameters import UserParameters
 from .seqfeature_ops import PlastidData
 from .extraction_ops import ExtractAndCollect, DataCleaning
 from .alignment_ops import AlignmentCoordination
-from .plastome_burst_and_align import PlastomeBurstAndAlign
+from .plast_burst_align import PlastBurstAlign
 from .alignment_tools import MAFFT, ClustalOmega, MUSCLE
-__all__ = ['PlastomeBurstAndAlign', 'UserParameters', 'PlastidData',
+__all__ = ['PlastBurstAlign', 'UserParameters', 'PlastidData',
            'ExtractAndCollect', 'DataCleaning', 'AlignmentCoordination', 'MAFFT', 'ClustalOmega', 'MUSCLE' ]

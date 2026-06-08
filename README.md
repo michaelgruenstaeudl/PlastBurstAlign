@@ -1,4 +1,4 @@
-# plastburstalign
+# PlastBurstAlign
 A Python tool to extract and align genes, introns, and intergenic spacers across thousands of plastid genomes using associative arrays
 
 ---
@@ -17,7 +17,7 @@ The multiple sequence alignment (MSA) of a set of plastid genomes is challenging
 The software `plastburstalign` addresses these and other challenges: it provides an MSA procedure that extracts and aligns genes, introns, and intergenic spacers across hundreds or thousands of plastid genomes in an autonomous fashion.
 
 ### Overview of process
-![Depiction of plastomes being split according to specified marker type; the extracted sequences are then aligned and concatenated](docs/PlastomeBurstAndAlign_ProcessOverview.png)
+![Depiction of plastomes being split according to specified marker type; the extracted sequences are then aligned and concatenated](docs/PlastBurstAlign_ProcessOverview.png)
 
 ### Main features
 - Extraction of all genome regions from set of input plastid genomes, followed by grouping and alignment of the extracted regions:
@@ -59,8 +59,8 @@ The software `plastburstalign` addresses these and other challenges: it provides
 ### Installation on Linux (Debian)
 ```bash
 # Installation
-#pip install git+https://github.com/michaelgruenstaeudl/PlastomeBurstAndAlign.git  
-#pip3 install git+ssh://git@github.com/michaelgruenstaeudl/PlastomeBurstAndAlign.git
+#pip install git+https://github.com/michaelgruenstaeudl/PlastBurstAlign.git  
+#pip3 install git+ssh://git@github.com/michaelgruenstaeudl/PlastBurstAlign.git
 
 pip install plastburstalign
 ```
@@ -69,8 +69,8 @@ You must manually install one of the supported alignment tools (MAFFT, MUSCLE, C
 ### Installation of External alignment tools
 ### Option 1 — Conda environment (recommended)
 ```bash
-git clone https://github.com/michaelgruenstaeudl/PlastomeBurstAndAlign.git
-cd PlastomeBurstAndAlign
+git clone https://github.com/michaelgruenstaeudl/PlastBurstAlign.git
+cd PlastBurstAlign
 conda env create -f environment.yml
 conda activate plastburstalign
 ```
@@ -108,7 +108,7 @@ plastburstalign \
 | `-s` | Sequence type to extract (e.g., cds, int, igs) | `cds` |
 | `-a` | Alignment tool to use | `mafft` |
 | `-l` | Minimum sequence length (bp); regions shorter than this are excluded| `9` |
-| `-t` | Minimum number of taxa in which a region must be present to be extracted | `3` |
+| `-t` | Minimum number of taxa (int) or relative frequency (0<value<=1) in which a region must be present to be extracted | `0.1` |
 | `-n` | Number of threads to use| `8` |
 | `--config` | Path to YAML config file containing parameters | `config.yaml` |
 
@@ -118,8 +118,8 @@ plastburstalign \
 If you cloned the repository:
 
 ```bash
-git clone https://github.com/michaelgruenstaeudl/PlastomeBurstAndAlign.git
-cd PlastomeBurstAndAlign
+git clone https://github.com/michaelgruenstaeudl/PlastBurstAlign.git
+cd PlastBurstAlign
 python -m plastburstalign
 ```
 
@@ -130,9 +130,9 @@ python -m plastburstalign
 You can also use the package directly in Python:
 
 ```python
-from plastburstalign import PlastomeBurstAndAlign
+from plastburstalign import PlastBurstAlign
 
-burst = PlastomeBurstAndAlign()
+burst = PlastBurstAlign()
 burst.execute()
 ```
 
@@ -163,4 +163,4 @@ As a side effect, the automatic standardization of tRNA gene names also decrease
 
 
 ### Exemplary usage
-See [this document](https://github.com/michaelgruenstaeudl/PlastomeBurstAndAlign/blob/main/docs/exemplary_usage.md)
+See [this document](https://github.com/michaelgruenstaeudl/PlastBurstAlign/blob/main/docs/exemplary_usage.md)
