@@ -48,10 +48,6 @@ def _save_region_unaligned(args: tuple) -> None:
         log.error(f"Error saving {feat_name}: {e}")
 
 
-
-
-
-
 class AlignmentCoordination:
     def __init__(self, plastid_data: PlastidData, user_params: Dict[str, Any]):
         """
@@ -142,6 +138,11 @@ class AlignmentCoordination:
             out_fn_aligned_nucl = os.path.join(fasta_dir, f"nucl_{k}.aligned.fasta")
             # Step 1. Align matrices via third-party alignment tool
             self.aligner.align(out_fn_unalign_nucl, out_fn_aligned_nucl)
+            # Report whether the aligner produced output
+            if os.path.exists(out_fn_aligned_nucl) and os.path.getsize(out_fn_aligned_nucl) > 0:
+                log.debug(f"Alignment successful for `{k}` -> {out_fn_aligned_nucl}")
+            else:
+                log.warning(f"Alignment for `{k}` produced no output: {out_fn_aligned_nucl}")
         ### Inner Function - End ###
 
         # Step 2. Use ThreadPoolExecutor to parallelize alignment
@@ -180,6 +181,12 @@ class AlignmentCoordination:
             out_fn_aligned_nucl = os.path.join(fasta_dir, f"nucl_{k}.aligned.fasta")
             # Step 1. Align matrices based on their PROTEIN sequences via third-party alignment tool
             self.aligner.align(out_fn_unalign_prot, out_fn_aligned_prot)
+            # Report whether the protein aligner produced output
+            if os.path.exists(out_fn_aligned_prot) and os.path.getsize(out_fn_aligned_prot) > 0:
+                log.debug(f"Protein alignment successful for `{k}` -> {out_fn_aligned_prot}")
+            else:
+                log.warning(f"Protein alignment for `{k}` produced no output: {out_fn_aligned_prot}")
+                return
             # Step 2. Conduct actual back-translation from PROTEINS TO NUCLEOTIDES
             try:
                 translator = BackTranslation(
@@ -190,6 +197,11 @@ class AlignmentCoordination:
                     11
                 )
                 translator.backtranslate()
+                # Report whether back-translation produced nucleotide alignment
+                if os.path.exists(out_fn_aligned_nucl) and os.path.getsize(out_fn_aligned_nucl) > 0:
+                    log.debug(f"Back-translation successful for `{k}` -> {out_fn_aligned_nucl}")
+                else:
+                    log.warning(f"Back-translation produced no output for `{k}`: {out_fn_aligned_nucl}")
             except Exception as err:
                 log.warning(
                     f"Unable to conduct back-translation of `{k}`. "
