@@ -28,8 +28,8 @@ class AlignmentTool(ABC):
         """
         self.user_params = user_params or {}
         self.exec_path = None
-        self.num_threads = self._set_num_threads(user_params)
-        # self.num_threads = "20"  # For debugging, set to 1 to avoid multiprocessing issues"
+        # self.num_threads = self._set_num_threads(user_params)
+        self.num_threads = "1"  # For debugging, set to 1 to avoid multiprocessing issues"
         self.tool_params = self._get_tool_params(user_params)
         
         if tool_path:
@@ -105,8 +105,6 @@ class AlignmentTool(ABC):
             log.error(f"output file path is invalid: {output_file}")
             return False
         return True
-
-
 class MAFFT(AlignmentTool):
     """MAFFT alignment tool implementation."""
 
