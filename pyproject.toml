@@ -10,7 +10,7 @@ authors = [
     {name = "Thanina Hamitouche", email = "t_hamitouche@mail.fhsu.edu"},
     {name = "Michael Gruenstaeudl, PhD", email = "m_gruenstaeudl@fhsu.edu"}
 ]
-version = "0.9.8"
+version = "0.9.9"
 
 requires-python = ">=3.11"
 dependencies = [
