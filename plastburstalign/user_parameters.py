@@ -14,6 +14,7 @@ class SelectMode(str, Enum):
     """
     An enumeration class used to keep track of selection and alignment modes.
     """
+
     CDS = "cds"
     INT = "int"
     IGS = "igs"
@@ -25,25 +26,26 @@ class SelectMode(str, Enum):
 
 class UserParameters(Dict[str, Any]):
     def __init__(
-            self,
-            in_dir: str = "./input",
-            out_dir: str = "./output",
-            select_mode: str = "cds",
-            fileext: str = ".gb",
-            exclude_fullcds: Optional[List[str]] = None,
-            exclude_region: Optional[List[str]] = None,
-            min_seq_length: int = 3,
-            min_num_taxa: Union[int, float] = 1,
-            num_threads: Union[str, int] = "auto",
-            verbose: bool = False,
-            order: str = "seq",
-            concat: bool = False,
-            alignment_tool: str = "muscle",
-            alignment_tool_path: Optional[str] = None,
-            alignment_tool_config: Optional[Dict[str, Any]] = None,
-            config_file: Optional[str] = None,
-            include_trna: bool = True,
-            include_rrna: bool = True
+        self,
+        in_dir: str = "./input",
+        out_dir: str = "./output",
+        select_mode: str = "cds",
+        fileext: str = ".gb",
+        exclude_fullcds: Optional[List[str]] = None,
+        exclude_region: Optional[List[str]] = None,
+        min_seq_length: int = 3,
+        min_num_taxa: Union[int, float] = 1,
+        num_threads: Union[str, int] = "auto",
+        verbose: bool = False,
+        order: str = "seq",
+        concat: bool = False,
+        alignment_tool: str = "mafft",
+        alignment_tool_path: Optional[str] = None,
+        alignment_tool_config: Optional[Dict[str, Any]] = None,
+        alignment_command: Optional[str] = None,
+        config_file: Optional[str] = None,
+        include_trna: bool = True,
+        include_rrna: bool = True,
     ):
         """
         A dictionary that validates user parameters that are to be used within the package.
@@ -88,6 +90,7 @@ class UserParameters(Dict[str, Any]):
         self._set_alignment_tool(alignment_tool)
         self._set_alignment_tool_path(alignment_tool_path)
         self._set_alignment_tool_config(alignment_tool_config)
+        self._set_alignment_command(alignment_command)
         self._set_config_file(config_file)
 
     def _set_select_mode(self, select_mode: str):
@@ -222,6 +225,13 @@ class UserParameters(Dict[str, Any]):
         self._test_type("alignment_tool_config", alignment_tool_config, dict)
         self["alignment_tool_config"] = alignment_tool_config
 
+    def _set_alignment_command(self, alignment_command: Optional[str]):
+        if alignment_command is not None:
+            self._test_type("alignment_command", alignment_command, str)
+            self["alignment_command"] = alignment_command.strip()
+        else:
+            self["alignment_command"] = None
+
     def _set_config_file(self, config_file: Optional[str]):
         if config_file and not os.path.exists(config_file):
             log.warning(f"Specified config file does not exist: {config_file}")
@@ -252,7 +262,9 @@ class UserParametersScript(UserParameters):
         "concat": "concat",
         "alignmenttool": "alignment_tool",
         "alignmenttoolpath": "alignment_tool_path",
-        "config": "config_file"
+        "alignmentcommand": "alignment_command",
+        "alignmentcmd": "alignment_command",
+        "config": "config_file",
     }
 
     def __init__(self):
@@ -261,31 +273,31 @@ class UserParametersScript(UserParameters):
         """
         parser = self._get_parser()
         args = parser.parse_args()
-        
+
         # Load config file if specified
         config_params = {}
-        if hasattr(args, 'config') and args.config:
+        if hasattr(args, "config") and args.config:
             config_params = self._load_config_file(args.config)
-        
+
         # Merge command line args with config file, command line takes precedence
         args_dict = self._get_construct_dict(args)
         merged_params = {**config_params, **args_dict}
-        
+
         super().__init__(**merged_params)
 
     @staticmethod
     def _load_config_file(config_path: str) -> Dict[str, Any]:
         """
         Load parameters from a YAML config file.
-        
+
         Args:
             config_path: Path to the YAML config file
-            
+
         Returns:
             Dictionary of parameters from config file
         """
         try:
-            with open(config_path, 'r') as f:
+            with open(config_path, "r") as f:
                 config = yaml.safe_load(f)
             log.info(f"Loaded configuration from {config_path}")
             return config or {}
@@ -333,18 +345,18 @@ class UserParametersScript(UserParameters):
             help="(Optional) Type of regions to be extracted (`cds`, `int`, `igs`, or `rna` for tRNAs and rRNAs)",
         )
         parser.add_argument(
-            "--no-trna",
+            "--trna",
             dest="include_trna",
-            action='store_false',
+            action=argparse.BooleanOptionalAction,
             default=None,
-            help="Disable tRNA extraction and alignment in RNA mode (default: enabled)",
+            help="Enable or disable tRNA extraction and alignment in RNA mode (default: enabled)",
         )
         parser.add_argument(
-            "--no-rrna",
+            "--rrna",
             dest="include_rrna",
-            action='store_false',
+            action=argparse.BooleanOptionalAction,
             default=None,
-            help="Disable rRNA extraction and alignment in RNA mode (default: enabled)",
+            help="Enable or disable rRNA extraction and alignment in RNA mode (default: enabled)",
         )
         parser.add_argument(
             "--fileext",
@@ -371,7 +383,7 @@ class UserParametersScript(UserParameters):
                 "(Optional) List of regions to be excluded (specific regions by name). "
                 "Using the argument will lead to an exception for select mode `cds` as "
                 "`exclcds` should be used for that purpose."
-            )
+            ),
         )
         parser.add_argument(
             "--minseqlength",
@@ -416,9 +428,8 @@ class UserParametersScript(UserParameters):
             "-c",
             action="store_true",
             required=False,
-            #help="(Optional) Enable sequential writing of alignment concatenation"
-            help="(Optional) Enable concatenation of individual alignments and writing of concatenation file to disk"
-
+            # help="(Optional) Enable sequential writing of alignment concatenation"
+            help="(Optional) Enable concatenation of individual alignments and writing of concatenation file to disk",
         )
         parser.add_argument(
             "--alignmenttool",
@@ -435,6 +446,18 @@ class UserParametersScript(UserParameters):
             help="(Optional) Path to alignment tool executable",
         )
         parser.add_argument(
+            "--alignmentcommand",
+            "--alignmentcmd",
+            type=str,
+            required=False,
+            default=argparse.SUPPRESS,
+            help=(
+                "Custom alignment command template. Placeholders: "
+                "%%INPUT%% (input FASTA), %%OUTPUT%% (output FASTA), %%THREADS%% (budgeted threads). "
+                "Example: 'mafft --thread %%THREADS%% --retree 1 %%INPUT%% > %%OUTPUT%%'"
+            ),
+        )
+        parser.add_argument(
             "--config",
             type=str,
             required=False,
@@ -447,7 +470,5 @@ class UserParametersScript(UserParameters):
         # map the cmd argument names to class constructor parameters,
         # and remove empty argument values (`None`)
         args_dict = vars(args)
-        args_dict = {
-            cls._construct_name_map[k]: v for k, v in args_dict.items() if v is not None
-        }
+        args_dict = {cls._construct_name_map[k]: v for k, v in args_dict.items() if v is not None}
         return args_dict

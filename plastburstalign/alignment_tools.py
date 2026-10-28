@@ -4,7 +4,6 @@ Supports multiple alignment tools (MAFFT, Clustal Omega, etc.)
 """
 
 import os
-import shlex
 import shutil
 import subprocess
 from abc import ABC, abstractmethod
@@ -19,7 +18,9 @@ class AlignmentTool(ABC):
     Defines the interface that all alignment tool implementations must follow.
     """
 
-    def __init__(self, user_params: Optional[Dict[str, Any]] = None, tool_path: Optional[str] = None):
+    def __init__(
+        self, user_params: Optional[Dict[str, Any]] = None, tool_path: Optional[str] = None
+    ):
         """
         Initialize the alignment tool.
 
@@ -32,12 +33,12 @@ class AlignmentTool(ABC):
         # self.num_threads = self._set_num_threads(user_params)
         # self.num_threads = "1"  # For debugging, set to 1 to avoid multiprocessing issues"
         self.tool_params = self._get_tool_params(user_params)
-        
+
         if tool_path:
             self._validate_tool_path(tool_path)
         else:
             self._find_tool()
-        
+
         self._log_configuration()
 
     @abstractmethod
@@ -59,7 +60,6 @@ class AlignmentTool(ABC):
         """
         pass
 
-
     def _get_tool_params(self, user_params: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         """Extract tool-specific parameters from user parameters."""
         if user_params and isinstance(user_params, dict):
@@ -79,11 +79,10 @@ class AlignmentTool(ABC):
     def _log_configuration(self):
         """Log the tool configuration."""
         tool_name = self.__class__.__name__
-        if self.exec_path :
+        if self.exec_path:
             log.info(f"configured {tool_name} with executable: {self.exec_path}")
         else:
             log.error(f" failed to configure {tool_name}")
-            
 
     def _validate_input(self, input_file: str, output_file: str) -> bool:
         """Validate input and output files."""
@@ -97,6 +96,8 @@ class AlignmentTool(ABC):
             log.error(f"output file path is invalid: {output_file}")
             return False
         return True
+
+
 class MAFFT(AlignmentTool):
     """MAFFT alignment tool implementation."""
 
@@ -124,7 +125,7 @@ class MAFFT(AlignmentTool):
 
         try:
             cmd = [self.exec_path]
-            
+
             # Add algorithm option (default: --auto)
             algorithm = self.tool_params.get("algorithm", "auto")
             if algorithm == "auto":
@@ -141,7 +142,7 @@ class MAFFT(AlignmentTool):
             elif algorithm == "maxiterate":
                 maxiterate_num = self.tool_params.get("maxiterate", 0)
                 cmd.extend(["--maxiterate", str(maxiterate_num)])
-            
+
             # Add thread option
             mafft_threads = self.tool_params.get("threads", 1)
             cmd.extend(["--thread", str(mafft_threads)])
@@ -149,23 +150,21 @@ class MAFFT(AlignmentTool):
             # Add other MAFFT options
             if self.tool_params.get("adjustdirection", True):
                 cmd.append("--adjustdirection")
-            
+
             if self.tool_params.get("quiet"):
                 cmd.append("--quiet")
-            
+
             # Add input file
             cmd.append(input_file)
-            
-            with open(output_file, 'w') as out_handle:
+
+            with open(output_file, "w") as out_handle:
                 process = subprocess.run(
-                    cmd,
-                    stdout=out_handle,
-                    stderr=subprocess.DEVNULL,
-                    text=True,
-                    check=False
+                    cmd, stdout=out_handle, stderr=subprocess.DEVNULL, text=True, check=False
                 )
             if process.returncode == 0:
-                log.info(f"     successfully aligned {os.path.basename(input_file)} using MAFFT with {mafft_threads} threads")
+                log.info(
+                    f"     successfully aligned {os.path.basename(input_file)} using MAFFT with {mafft_threads} threads"
+                )
                 return True
             else:
                 log.error(f"  MAFFT failed with return code {process.returncode}")
@@ -202,39 +201,34 @@ class ClustalOmega(AlignmentTool):
 
         try:
             cmd = [self.exec_path]
-            
+
             # Add threads
-    
-            
+
             # Add input/output files
             cmd.extend(["--infile", input_file])
             cmd.extend(["--outfile", output_file])
-            
+
             # Add output format (default: fasta)
             outfmt = self.tool_params.get("outfmt", "fasta")
             cmd.extend(["--outfmt", outfmt])
-            
+
             clustalo_threads = self.tool_params.get("threads", 1)
             cmd.extend(["--thread", str(clustalo_threads)])
-            
+
             if self.tool_params.get("dealign"):
                 cmd.append("--dealign")
-            
+
             if self.tool_params.get("verbose"):
                 cmd.append("--verbose")
-            
-        
-            
+
             log.debug(f"  running Clustal Omega with command: {' '.join(cmd)}")
             process = subprocess.run(
-                cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                text=True,
-                check=False
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True, check=False
             )
             if process.returncode == 0:
-                log.info(f"     successfully aligned {os.path.basename(input_file)} using Clustal Omega with {clustalo_threads} threads")
+                log.info(
+                    f"     successfully aligned {os.path.basename(input_file)} using Clustal Omega with {clustalo_threads} threads"
+                )
                 return True
             else:
                 log.error(f"  Clustal Omega failed with return code {process.returncode}")
@@ -271,39 +265,35 @@ class MUSCLE(AlignmentTool):
 
         try:
             cmd = [self.exec_path]
-            
+
             # Add input and output files
             cmd.extend(["-super5", input_file])
             cmd.extend(["-output", output_file])
-            
+
             # Add MUSCLE v5 options
             # Guide tree permutation (none, abc, acb, bca)
             perm = self.tool_params.get("perm")
             if perm is not None:
                 cmd.extend(["-perm", str(perm)])
-            
+
             # Perturbation seed
             perturb = self.tool_params.get("perturb")
             if perturb is not None:
                 cmd.extend(["-perturb", str(perturb)])
-            
+
             # Maximum gap fraction (0..1)
             # maxgapfract = self.tool_params.get("maxgapfract")
             # if maxgapfract is not None:
             #     cmd.extend(["-maxgapfract", str(maxgapfract)])
-            
+
             # # Minimum column confidence (0..1)
             # minconf = self.tool_params.get("minconf")
             # if minconf is not None:
             #     cmd.extend(["-minconf", str(minconf)])
-        
+
             log.debug(f"  running MUSCLE with command: {' '.join(cmd)}")
             process = subprocess.run(
-                cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                text=True,
-                check=False
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True, check=False
             )
             if process.returncode == 0:
                 log.info(f"     successfully aligned {os.path.basename(input_file)} using MUSCLE")
@@ -434,7 +424,9 @@ class GenericAlignmentTool(AlignmentTool):
                 check=False,
             )
             if process.returncode == 0:
-                log.info(f"     successfully aligned {os.path.basename(input_file)} using {self.exec_path}")
+                log.info(
+                    f"     successfully aligned {os.path.basename(input_file)} using {self.exec_path}"
+                )
                 return True
             else:
                 log.error(f"  generic aligner failed with return code {process.returncode}")
@@ -444,19 +436,18 @@ class GenericAlignmentTool(AlignmentTool):
             return False
 
 
-def get_alignment_tool(tool_name: str, user_params: Optional[Dict[str, Any]] = None,
-                       tool_path: Optional[str] = None) -> Optional[AlignmentTool]:
-    """
-    Factory function to get the appropriate alignment tool.
+def get_alignment_tool(
+    tool_name: str, user_params: Optional[Dict[str, Any]] = None, tool_path: Optional[str] = None
+) -> Optional[AlignmentTool]:
+    user_params = user_params or {}
+    custom_cmd = user_params.get("alignment_command") or user_params.get(
+        "alignment_tool_config", {}
+    ).get("command_template")
 
-    Args:
-        tool_name: Name of the alignment tool ('mafft', 'clustal', etc.)
-        user_params: User parameters dict
-        tool_path: Optional path to the tool executable
+    # If an explicit command template is given, prioritize CustomAligner
+    if custom_cmd or (isinstance(tool_name, str) and tool_name.lower().strip() == "custom"):
+        return CustomAligner(user_params, tool_path, command_template=custom_cmd)
 
-    Returns:
-        AlignmentTool instance or None if tool is not supported
-    """
     if not isinstance(tool_name, str) or not tool_name.strip():
         log.warning("no alignment tool specified; defaulting to mafft")
         tool_name = "mafft"
@@ -474,3 +465,99 @@ def get_alignment_tool(tool_name: str, user_params: Optional[Dict[str, Any]] = N
     else:
         log.warning(f"unknown alignment tool: {tool_name}; attempting generic wrapper")
         return GenericAlignmentTool(user_params, tool_path)
+
+
+class CustomAligner(AlignmentTool):
+    """
+    Executes sequence alignment via a user-defined command template.
+
+    Supports placeholders:
+      - %INPUT% / {input}: Path to input unaligned FASTA
+      - %OUTPUT% / {output}: Path to output aligned FASTA
+      - %THREADS% / {threads}: Dynamically budgeted threads for this invocation
+    """
+
+    def __init__(
+        self,
+        user_params: Optional[Dict[str, Any]] = None,
+        tool_path: Optional[str] = None,
+        command_template: Optional[str] = None,
+    ):
+        self.command_template = (
+            command_template
+            or (user_params or {}).get("alignment_command")
+            or (user_params or {}).get("alignment_tool_config", {}).get("command_template")
+        )
+        if not self.command_template:
+            raise ValueError("CustomAligner requires a non-empty command template.")
+        super().__init__(user_params, tool_path)
+
+    def _find_tool(self):
+        """Custom commands specify their own binary; mark exec_path as valid."""
+        self.exec_path = "custom_command"
+
+    def _get_budgeted_threads(self) -> int:
+        """
+        Calculates per-worker thread budget to prevent CPU oversubscription:
+            threads_per_worker = max(1, total_threads // num_workers)
+        """
+        total_threads = int(self.user_params.get("num_threads", 1))
+        # If tool_params explicitly overrides thread count, honor it
+        configured_threads = self.tool_params.get("threads")
+        if configured_threads is not None:
+            return max(1, int(configured_threads))
+        return max(1, total_threads)
+
+    def _build_command_string(self, input_file: str, output_file: str) -> str:
+        threads = self._get_budgeted_threads()
+        cmd = self.command_template
+        # Replace uppercase placeholders
+        cmd = cmd.replace("%INPUT%", input_file)
+        cmd = cmd.replace("%OUTPUT%", output_file)
+        cmd = cmd.replace("%THREADS%", str(threads))
+        # Support brace format placeholders
+        cmd = cmd.replace("{input}", input_file)
+        cmd = cmd.replace("{output}", output_file)
+        cmd = cmd.replace("{threads}", str(threads))
+        return cmd
+
+    def align(self, input_file: str, output_file: str) -> bool:
+        if not os.path.exists(input_file):
+            log.error(f"Input file does not exist: {input_file}")
+            return False
+
+        # Ensure parent output directory exists
+        os.makedirs(os.path.dirname(os.path.abspath(output_file)), exist_ok=True)
+
+        cmd_str = self._build_command_string(input_file, output_file)
+        log.info(f"Executing custom alignment command: {cmd_str}")
+
+        try:
+            # shell=True allows pipe/redirection syntax (e.g. mafft ... > output.fasta)
+            process = subprocess.run(
+                cmd_str,
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+
+            if process.returncode != 0:
+                log.error(
+                    f"Custom alignment failed with returncode {process.returncode}: {process.stderr.strip()}"
+                )
+                return False
+
+            if not os.path.exists(output_file) or os.path.getsize(output_file) == 0:
+                log.error(f"Alignment completed but output file is missing or empty: {output_file}")
+                return False
+
+            log.info(
+                f"Successfully aligned {os.path.basename(input_file)} -> {os.path.basename(output_file)}"
+            )
+            return True
+
+        except Exception as e:
+            log.error(f"Exception encountered during custom alignment execution: {e}")
+            return False

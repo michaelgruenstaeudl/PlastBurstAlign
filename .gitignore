@@ -4,3 +4,15 @@ __pycache__/
 build/
 dist/
 _devel/*
+# Local scratchpad and benchmarks
+sandbox/
+.pytest_cache/
+*.egg-info/
+.coverage
+
+# Benchmarking artifacts and test runs
+benchmarking/*_output_*
+benchmarking/*.tar.gz
+benchmarking/benchmark_*
+.coverage
+sandbox/

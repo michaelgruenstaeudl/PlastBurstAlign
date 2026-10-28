@@ -156,6 +156,6 @@ class MinNumTaxaTests(unittest.TestCase):
             with self.subTest(num_taxa=invalid_taxa):
                 data = PlastidData(params)
                 data.num_taxa = invalid_taxa
-                ExtractAndCollect(data, params)._extract_cds(
-                    self.record(), data.nucleotides, data.proteins
-                )
+                ExtractAndCollect(data, params)._extract_cds(self.record(), data.nucleotides, data.proteins)
+                with self.assertRaises(AttributeError):
+                    DataCleaning(data, params).clean()
