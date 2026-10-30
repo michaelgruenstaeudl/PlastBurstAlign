@@ -62,23 +62,43 @@ class DiskBackedFeatureStore:
                 description TEXT,
                 sequence TEXT NOT NULL,
                 seq_len INTEGER NOT NULL,
+                file_index INTEGER NOT NULL DEFAULT 0,
                 FOREIGN KEY (region_name) REFERENCES regions(region_name) ON DELETE CASCADE,
                 UNIQUE(region_name, taxon_name, seq_type)
             );
             """)
-        cursor.execute(
-            "CREATE INDEX IF NOT EXISTS idx_records_lookup ON"
-            " sequence_records(region_name, seq_type);"
-        )
+        self._migrate_schema(cursor)
+        # `idx_records_order` also serves (region_name, seq_type) lookups, so the
+        # former `idx_records_lookup` index is no longer created for new databases.
         cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_records_taxon ON"
             " sequence_records(taxon_name, region_name);"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_records_order ON"
+            " sequence_records(region_name, seq_type, file_index, id);"
         )
         self._conn.commit()
 
         # Pre-populate registered regions set from existing table
         cursor.execute("SELECT region_name FROM regions;")
         self._registered_regions = {row[0] for row in cursor.fetchall()}
+
+    @staticmethod
+    def _migrate_schema(cursor: sqlite3.Cursor) -> None:
+        """Bring databases created by older versions up to the current schema.
+
+        Version history:
+          * `file_index` (source GenBank file position, default 0) was added so
+            that record order is independent of extraction completion order.
+        """
+        cursor.execute("PRAGMA table_info(sequence_records);")
+        columns = {row[1] for row in cursor.fetchall()}
+        if "file_index" not in columns:
+            cursor.execute(
+                "ALTER TABLE sequence_records ADD COLUMN file_index INTEGER NOT NULL"
+                " DEFAULT 0;"
+            )
 
     @contextmanager
     def transaction(self) -> Iterator[Self]:
@@ -128,12 +148,14 @@ class DiskBackedFeatureStore:
         description: str,
         sequence: str,
         inv_name: str | None = None,
+        file_index: int = 0,
     ) -> bool:
         """Insert a sequence record for a region and taxon.
 
         Enforces uniqueness per (region, taxon, seq_type). Handles inverted repeat
-        deduplication when `inv_name` is provided. Returns True if inserted, False if
-        skipped.
+        deduplication when `inv_name` is provided. `file_index` is the position of
+        the source file in the ordered input file list; records are read back
+        ordered by (file_index, id). Returns True if inserted, False if skipped.
         """
         self.register_region(region_name, inv_name=inv_name)
 
@@ -159,9 +181,10 @@ class DiskBackedFeatureStore:
         cursor.execute(
             """
             INSERT OR IGNORE INTO sequence_records (
-                region_name, taxon_name, seq_type, seq_id, description, sequence, seq_len
+                region_name, taxon_name, seq_type, seq_id, description, sequence,
+                seq_len, file_index
             ) VALUES (
-                :region, :taxon, :type, :id, :desc, :seq, :length
+                :region, :taxon, :type, :id, :desc, :seq, :length, :file_index
             );
             """,
             {
@@ -172,6 +195,7 @@ class DiskBackedFeatureStore:
                 "desc": description,
                 "seq": sequence,
                 "length": seq_len,
+                "file_index": int(file_index),
             },
         )
         inserted = cursor.rowcount > 0
@@ -184,11 +208,18 @@ class DiskBackedFeatureStore:
         pdict: Any,
         seq_type: str,
         inv_map: dict[str, str] | None = None,
+        file_index: int = 0,
     ) -> None:
         """Batch-insert sequence records from an extracted dictionary into SQLite.
 
         Registers all regions upfront and bulk-inserts rows via executemany
         to eliminate per-record SQL compile and Python method overhead.
+
+        Records are either `SeqRecord` instances or flat tuples
+        `(taxon, description, sequence)` / `(taxon, description, sequence,
+        file_index)`. The optional fourth tuple element is the position of the
+        source file in the ordered input file list; when absent, the
+        `file_index` argument is used.
         """
         if not pdict:
             return
@@ -200,14 +231,17 @@ class DiskBackedFeatureStore:
             self.register_region(feat_name, inv_name=inv_map.get(feat_name))
 
         # 2. Vectorize rows into flat tuples
-        rows: list[tuple[str, str, str, str, str, str, int]] = []
+        rows: list[tuple[str, str, str, str, str, str, int, int]] = []
         cursor = self._conn.cursor()
 
         for feat_name, records in pdict.items():
             inv_name = inv_map.get(feat_name)
             for rec in records:
+                rec_file_index = file_index
                 if isinstance(rec, tuple):
-                    taxon_name, desc, seq_str = rec
+                    taxon_name, desc, seq_str = rec[0], rec[1], rec[2]
+                    if len(rec) > 3:
+                        rec_file_index = int(rec[3])
                     seq_id = taxon_name
                 else:
                     taxon_name = str(rec.id)
@@ -236,6 +270,7 @@ class DiskBackedFeatureStore:
                         desc,
                         seq_str,
                         len(seq_str),
+                        rec_file_index,
                     )
                 )
 
@@ -244,8 +279,9 @@ class DiskBackedFeatureStore:
             cursor.executemany(
                 """
                 INSERT OR IGNORE INTO sequence_records (
-                    region_name, taxon_name, seq_type, seq_id, description, sequence, seq_len
-                ) VALUES (?, ?, ?, ?, ?, ?, ?);
+                    region_name, taxon_name, seq_type, seq_id, description, sequence,
+                    seq_len, file_index
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?);
                 """,
                 rows,
             )
@@ -259,6 +295,7 @@ class DiskBackedFeatureStore:
         seq_type: str,
         record: SeqRecord,
         inv_name: str | None = None,
+        file_index: int = 0,
     ) -> bool:
         """Add a Biopython SeqRecord into the database."""
         return self.add_record(
@@ -269,6 +306,7 @@ class DiskBackedFeatureStore:
             description=record.description or "",
             sequence=str(record.seq),
             inv_name=inv_name,
+            file_index=file_index,
         )
 
     def has_region(self, region_name: str) -> bool:
@@ -307,7 +345,7 @@ class DiskBackedFeatureStore:
             SELECT seq_id, description, sequence
             FROM sequence_records
             WHERE region_name = :region AND seq_type = :type
-            ORDER BY id ASC;
+            ORDER BY file_index ASC, id ASC;
             """,
             {"region": region_name, "type": seq_type},
         )
@@ -321,13 +359,23 @@ class DiskBackedFeatureStore:
         ]
 
     def get_region_summary(self, seq_type: str = "nucl") -> dict[str, dict[str, int]]:
-        """Return aggregated summary per active region: taxon_count and max_seq_len."""
+        """Return aggregated summary per active region.
+
+        Keys per region: `count` (number of taxa), `max_len` (longest stored
+        sequence) and `min_len` (shortest sequence, not counting one trailing
+        stop `*`, which aligners do not treat as a residue). Regions without
+        records of `seq_type` report zeros.
+        """
         cursor = self._conn.cursor()
         cursor.execute(
             """
             SELECT r.region_name,
                    COUNT(s.id) AS taxon_count,
-                   COALESCE(MAX(s.seq_len), 0) AS max_len
+                   COALESCE(MAX(s.seq_len), 0) AS max_len,
+                   COALESCE(MIN(
+                       s.seq_len - (CASE WHEN substr(s.sequence, -1, 1) = '*'
+                                         THEN 1 ELSE 0 END)
+                   ), 0) AS min_len
             FROM regions r
             LEFT JOIN sequence_records s
               ON r.region_name = s.region_name AND s.seq_type = :type
@@ -340,6 +388,7 @@ class DiskBackedFeatureStore:
             row["region_name"]: {
                 "count": row["taxon_count"],
                 "max_len": row["max_len"],
+                "min_len": row["min_len"],
             }
             for row in cursor.fetchall()
         }
@@ -365,7 +414,7 @@ class DiskBackedFeatureStore:
             SELECT seq_id, description, sequence
             FROM sequence_records
             WHERE region_name = :region AND seq_type = :type
-            ORDER BY id ASC;
+            ORDER BY file_index ASC, id ASC;
             """,
             {"region": region_name, "type": seq_type},
         )

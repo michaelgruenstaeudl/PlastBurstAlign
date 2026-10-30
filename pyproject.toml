@@ -1,5 +1,7 @@
 [build-system]
-requires = ["setuptools", "wheel"]
+# setuptools>=77 is required for PEP 639 (SPDX `license` expression and
+# `license-files`); older backends reject a string-valued `license`.
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 
@@ -10,47 +12,90 @@ authors = [
     {name = "Thanina Hamitouche", email = "t_hamitouche@mail.fhsu.edu"},
     {name = "Michael Gruenstaeudl, PhD", email = "m_gruenstaeudl@fhsu.edu"}
 ]
-version = "1.3"
+version = "3.0.0rc1"
 
+readme = "README.md"
+license = "BSD-3-Clause"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
 dependencies = [
     "biopython>=1.85",
-    "coloredlogs>=15.0",
+    "numpy>=1.26",
+    "rich>=13",
     "psutil>=5.9",
-    "requests>=2.32",
     "pyyaml>=6.0.2",
+    "coloredlogs>=15.0",
 ]
 
-readme = "README.md"
+# No `License ::` classifier: PEP 639 deprecates it in favour of the SPDX
+# `license` expression above (setuptools warns if both are present).
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
 
-    "License :: OSI Approved :: BSD License",
-
-    "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
-
+    "Environment :: Console",
     "Intended Audience :: Science/Research",
     "Intended Audience :: Developers",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+
     "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "Typing :: Typed",
 ]
 keywords = [
     "bioinformatics",
     "alignment",
     "flatfile",
     "plastid genome",
+    "plastome",
+    "chloroplast",
+    "phylogenomics",
+    "supermatrix",
 ]
+
+[project.optional-dependencies]
+# Runtime test dependencies (what CI installs for the test matrix).
+test = [
+    "pytest>=8",
+    "pytest-cov>=7",
+]
+# Everything a contributor needs. Linters are pinned to a minor series so that
+# `ruff format --check` and `mypy` give the same answer locally and in CI; bump
+# them together with `.pre-commit-config.yaml`.
+dev = [
+    "pytest>=8",
+    "pytest-cov>=7",
+    "ruff>=0.17,<0.18",
+    "mypy>=2.4,<2.5",
+    "types-PyYAML",
+    "build>=1.2",
+    "twine>=6",
+    "pre-commit>=3.7",
+]
+# Placeholder: the documentation toolchain is chosen when the docs site lands.
+docs = []
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["plastburstalign"]
+include = ["plastburstalign", "plastburstalign.*"]
+
+[tool.setuptools.package-data]
+plastburstalign = ["py.typed"]
 
 [project.scripts]
 plastburstalign = "plastburstalign.__main__:main"
+pba = "plastburstalign.__main__:main"
 
 [project.urls]
 Homepage = "https://gruenstaeudl-lab.com/"
 Repository = "https://github.com/michaelgruenstaeudl/PlastBurstAlign"
+Issues = "https://github.com/michaelgruenstaeudl/PlastBurstAlign/issues"
+Changelog = "https://github.com/michaelgruenstaeudl/PlastBurstAlign/blob/main/CHANGELOG.md"
 
 [tool.mypy]
 python_version = "3.11"
@@ -58,9 +103,23 @@ ignore_missing_imports = true
 follow_imports = "silent"
 check_untyped_defs = true
 
+# `mypy plastburstalign` gates the whole package. The modules below are legacy
+# code (Biopython feature handling with many Optional locations/sequences) that
+# still has type errors; errors are ignored for them only and they are to be
+# typed incrementally -- remove an entry once its module is clean.
+# Everything else (storage, helpers, task_queue, ephemeral_engine, nexus_ops,
+# alignment_ops, alignment_tools, cluster_ops, user_parameters, logging_ops,
+# plast_burst_align, __init__) is fully checked.
+[[tool.mypy.overrides]]
+module = [
+    "plastburstalign.extraction_ops",
+    "plastburstalign.seqfeature_ops",
+]
+ignore_errors = true
+
 [tool.ruff]
 line-length = 88
-target-version = "py310"
+target-version = "py311"
 extend-exclude = [
     "benchmarking/legacyversions",
 ]
@@ -82,13 +141,40 @@ ignore = [
 ]
 "__init__.py" = ["F401"]
 
+# Local runs stay coverage-free (`-p no:cov`): `python -m pytest -q tests`
+# behaves exactly as before. CI (and anyone who wants coverage) replaces these
+# addopts on the command line, which re-enables the pytest-cov plugin (a later
+# `-p cov` does NOT work: the plugin's registered name is `pytest_cov`):
+#
+#   python -m pytest -o addopts="-v" --cov --cov-report=term --cov-report=xml tests
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-v -p no:cov"
 
 [tool.coverage.run]
 source = ["plastburstalign"]
+branch = true
+# Worker processes (ProcessPoolExecutor / multiprocessing) and `python -m
+# plastburstalign` subprocesses started by the CLI tests are measured too.
+# `parallel` writes one data file per process; pytest-cov combines them.
+# `patch = ["subprocess"]` needs coverage>=7.10 (older versions only warn).
+parallel = true
+concurrency = ["thread", "multiprocessing"]
+patch = ["subprocess"]
+relative_files = true
 omit = ["tests/*", "benchmarking/*"]
 
 [tool.coverage.report]
 show_missing = true
+skip_empty = true
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "@(typing\\.)?overload",
+]
+# The coverage gate (`--cov-fail-under`) is passed by the CI workflow, not set
+# here, so local `pytest --cov` runs on a subset of tests do not fail.
+
+[tool.coverage.xml]
+output = "coverage.xml"

@@ -1,14 +1,39 @@
 name: plastburstalign
+# conda-forge first, then bioconda (the order bioconda recommends); use
+# `conda config --set channel_priority strict` for reproducible solves.
 channels:
-  - bioconda
   - conda-forge
+  - bioconda
 dependencies:
-  - python=3.11
-  - biopython>=1.78
-  - coloredlogs>=14.0
+  - python=3.12
+  # --- PlastBurstAlign runtime dependencies (mirror pyproject.toml) ---
+  - numpy>=1.26
+  - rich>=13
+  - biopython>=1.85
   - psutil>=5.9
-  - requests
-  - pyyaml>=6.0
+  - pyyaml>=6.0.2
+  - coloredlogs>=15.0
+  # --- external aligners (optional: without them PlastBurstAlign falls back to
+  #     its slower built-in pure-Python aligner) ---
   - mafft
-  - muscle
+  - muscle>=5
   - clustalo
+
+  # --- optional: developer tools (or `pip install -e ".[dev]"`) ---
+  # - pytest>=8
+  # - pytest-cov>=7
+  # - ruff>=0.17,<0.18
+  # - mypy>=2.4,<2.5
+  # - types-pyyaml
+  # - python-build
+  # - twine
+  # - pre-commit
+  #
+  # --- optional: PlastBench topology metrics (Robinson-Foulds distances) ---
+  # - fasttree
+  # - iqtree
+  #
+  # --- install the package itself from a checkout ---
+  # - pip
+  # - pip:
+  #     - -e .

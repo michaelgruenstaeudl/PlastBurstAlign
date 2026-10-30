@@ -19,7 +19,7 @@ from .cluster_ops import (
 from .extraction_ops import DataCleaning, ExtractAndCollect
 from .logging_ops import logger as log
 from .seqfeature_ops import PlastidData
-from .user_parameters import UserParameters
+from .user_parameters import SelectMode, UserParameters
 
 
 class PlastBurstAlign:
@@ -41,10 +41,19 @@ class PlastBurstAlign:
             self.user_params.get("align_partition") is not None
             or self.user_params.get("finalize_slurm") is True
         )
+        self.plastid_data: PlastidData | None
         if not is_worker_or_final:
             self.plastid_data = PlastidData(self.user_params)
         else:
             self.plastid_data = None
+
+    def _require_plastid_data(self) -> PlastidData:
+        if self.plastid_data is None:
+            raise ClusterExecutionError(
+                "PlastidData is not initialized (cluster worker/finalizer runs "
+                "create it from the manifest)"
+            )
+        return self.plastid_data
 
     def execute(self):
         """Dispatches execution based on user parameters."""
@@ -59,41 +68,56 @@ class PlastBurstAlign:
 
     def _execute_monolithic(self):
         """Standard single-node monolithic execution."""
-        extractor = ExtractAndCollect(self.plastid_data, self.user_params)
+        plastid_data = self._require_plastid_data()
+        extractor = ExtractAndCollect(plastid_data, self.user_params)
         extractor.extract()
 
-        cleaner = DataCleaning(self.plastid_data, self.user_params)
+        cleaner = DataCleaning(plastid_data, self.user_params)
         cleaner.clean()
 
-        aligncoord = AlignmentCoordination(self.plastid_data, self.user_params)
+        aligncoord = AlignmentCoordination(plastid_data, self.user_params)
         aligncoord.perform_MSAs()
         if self.user_params.get("concat"):
             aligncoord.concat_MSAs()
 
     def _execute_export(self):
         """Extracts and cleans features, exports partition manifest and Slurm job scripts."""
-        extractor = ExtractAndCollect(self.plastid_data, self.user_params)
+        plastid_data = self._require_plastid_data()
+        extractor = ExtractAndCollect(plastid_data, self.user_params)
         extractor.extract()
 
-        cleaner = DataCleaning(self.plastid_data, self.user_params)
+        cleaner = DataCleaning(plastid_data, self.user_params)
         cleaner.clean()
 
-        out_dir = self.user_params.get("out_dir")
+        out_dir: str = self.user_params["out_dir"]
         num_partitions = self.user_params.get("slurm_partitions", 10)
-        mode = self.user_params.get("select_mode")
+        mode: SelectMode = self.user_params["select_mode"]
         prefix = "prot" if mode.collects_proteins() else "nucl"
-        regions = list(self.plastid_data.nucleotides.keys())
+        regions = list(plastid_data.nucleotides.keys())
 
         log.info(
             f"Exporting Slurm cluster manifest for {len(regions)} regions into "
             f"{num_partitions} partitions..."
         )
 
+        # Partition weights come from the store's region summary (work estimate
+        # N * L^alpha of the alignment that will actually run: protein loci for CDS
+        # mode), so export does not depend on any pre-existing unaligned FASTA.
+        # Workers export their own unaligned FASTA from the store on demand.
+        try:
+            region_summary = plastid_data.store.get_region_summary(seq_type=prefix)
+        except Exception as err:
+            log.warning(f"Unable to read region summary for partitioning: {err}")
+            region_summary = {}
+        if not isinstance(region_summary, dict):
+            region_summary = {}
+
         partitions = ClusterPartitionEngine.partition_regions(
             regions=regions,
             out_dir=out_dir,
             num_partitions=num_partitions,
             prefix=prefix,
+            region_summary=region_summary,
         )
 
         manifest_partitions: dict[str, dict[str, Any]] = {}
@@ -101,6 +125,7 @@ class PlastBurstAlign:
             manifest_partitions[str(p.partition_id)] = {
                 "regions": p.regions,
                 "estimated_bytes": p.estimated_bytes,
+                "weight_kind": p.weight_kind,
             }
 
         manifest = ClusterManifest(
@@ -131,15 +156,43 @@ class PlastBurstAlign:
         )
         log.info("Slurm cluster export complete.")
 
+    def _apply_manifest_to_params(self, manifest: ClusterManifest) -> None:
+        """Adopts what the export step recorded in the manifest.
+
+        The generated Slurm scripts invoke workers and the finalizer without the
+        selection mode or aligner options, so the manifest is the source of truth
+        for the mode and falls back for the aligner settings (explicitly given
+        non-default worker options win).
+        """
+        params = self.user_params
+        mode = SelectMode.__members__.get(
+            str(manifest.select_mode).split(".")[-1].strip().upper()
+        )
+        if mode is not None:
+            params["select_mode"] = mode
+        if manifest.alignment_tool and params.get("alignment_tool") in (None, "mafft"):
+            params["alignment_tool"] = manifest.alignment_tool
+        if manifest.alignment_command and not params.get("alignment_command"):
+            params["alignment_command"] = manifest.alignment_command
+        if (
+            manifest.alignment_tool_path
+            and not params.get("alignment_tool_path")
+            and os.path.exists(manifest.alignment_tool_path)
+        ):
+            params["alignment_tool_path"] = manifest.alignment_tool_path
+        if manifest.adaptive_heuristics is False:
+            params["adaptive_heuristics"] = False
+
     def _execute_worker(self):
         """Worker task execution: aligns assigned partition regions."""
-        out_dir = self.user_params.get("out_dir")
-        partition_id = self.user_params.get("align_partition")
+        out_dir: str = self.user_params["out_dir"]
+        partition_id: int = self.user_params["align_partition"]
         manifest_path = self.user_params.get("manifest_path") or os.path.join(
             out_dir, "slurm_manifest.json"
         )
 
         manifest = ClusterPartitionEngine.load_manifest(manifest_path)
+        self._apply_manifest_to_params(manifest)
         p_key = str(partition_id)
         if p_key not in manifest.partitions:
             raise ClusterExecutionError(
@@ -171,12 +224,13 @@ class PlastBurstAlign:
 
     def _execute_finalize(self):
         """Finalizer task execution: validates receipts and concatenates supermatrices."""
-        out_dir = self.user_params.get("out_dir")
+        out_dir: str = self.user_params["out_dir"]
         manifest_path = self.user_params.get("manifest_path") or os.path.join(
             out_dir, "slurm_manifest.json"
         )
 
         manifest = ClusterPartitionEngine.load_manifest(manifest_path)
+        self._apply_manifest_to_params(manifest)
         all_done, missing_ids, successful_regions = (
             PartitionReceipt.verify_all_completed(
                 out_dir=out_dir,

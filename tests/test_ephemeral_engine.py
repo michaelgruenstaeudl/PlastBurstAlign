@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-import os
-from pathlib import Path
 import unittest
+from pathlib import Path
 
 from plastburstalign.alignment_tools import MAFFT
 from plastburstalign.ephemeral_engine import EphemeralScratchManager

@@ -88,6 +88,13 @@ class UserParameters(Dict[str, Any]):
             include_rrna: Extract and align rRNAs in RNA mode (default True).
         """
         super().__init__()
+        # Cluster mode flags must be known before the input directory is validated:
+        # workers and the finalizer only use the existing feature store and are run
+        # from the output directory, where no `./input` exists.
+        self["align_partition"] = (
+            int(align_partition) if align_partition is not None else None
+        )
+        self["finalize_slurm"] = bool(finalize_slurm)
         self._set_select_mode(select_mode)
         self._set_rna_options(include_trna, include_rrna)
         self._set_in_dir(in_dir)
@@ -113,10 +120,6 @@ class UserParameters(Dict[str, Any]):
         self["slurm_mem"] = str(slurm_mem)
         self["slurm_time"] = str(slurm_time)
         self["slurm_partition"] = slurm_partition
-        self["align_partition"] = (
-            int(align_partition) if align_partition is not None else None
-        )
-        self["finalize_slurm"] = bool(finalize_slurm)
         self["manifest_path"] = manifest_path
         self._set_individual_nexus(individual_nexus)
         self._set_scratch_dir(scratch_dir)
@@ -208,27 +211,28 @@ class UserParameters(Dict[str, Any]):
         self["min_num_taxa"] = min_num_taxa
 
     def _set_num_threads(self, num_threads: Union[str, int]):
+        resolved: Any = num_threads
         if isinstance(num_threads, str):
             num_threads_clean = num_threads.strip().lower()
             if num_threads_clean == "auto":
                 try:
-                    num_threads = os.cpu_count()
+                    resolved = os.cpu_count()
                 except NotImplementedError:
-                    num_threads = multiprocessing.cpu_count()
+                    resolved = multiprocessing.cpu_count()
             elif num_threads_clean.isnumeric():
-                num_threads = int(num_threads_clean)
+                resolved = int(num_threads_clean)
             else:
                 log.critical(f"Invalid `num_threads` value provided: {num_threads}")
                 raise ValueError
 
-        if num_threads is None:
-            num_threads = 1
+        if resolved is None:
+            resolved = 1
 
-        self._test_type("num_threads", num_threads, int)
-        if num_threads < 1:
-            log.critical(f"Invalid `num_threads` value provided: {num_threads}")
+        self._test_type("num_threads", resolved, int)
+        if resolved < 1:
+            log.critical(f"Invalid `num_threads` value provided: {resolved}")
             raise ValueError
-        self["num_threads"] = num_threads
+        self["num_threads"] = resolved
 
     def _set_verbose(self, verbose: bool):
         self._test_type("verbose", verbose, bool)

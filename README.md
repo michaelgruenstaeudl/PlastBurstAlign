@@ -3,7 +3,7 @@
 [![CI](https://github.com/michaelgruenstaeudl/PlastBurstAlign/actions/workflows/ci.yml/badge.svg)](https://github.com/michaelgruenstaeudl/PlastBurstAlign/actions/workflows/ci.yml)
 [![Code style: ruff](https://img.shields.io/badge/code%20style-ruff-000000.svg)](https://github.com/astral-sh/ruff)
 [![Type Checked: mypy](https://img.shields.io/badge/type%20checked-mypy-blue.svg)](https://mypy-lang.org/)
-[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
+[![License: BSD-3-Clause](https://img.shields.io/badge/License-BSD_3--Clause-blue.svg)](https://opensource.org/licenses/BSD-3-Clause)
 
 A high-performance Python tool to extract and align genes, introns, and intergenic spacers across thousands of plastid genomes without memory exhaustion.
 

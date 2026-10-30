@@ -1,14 +1,26 @@
-"""Concurrency utilities, task queues, and dynamic core budget management."""
+"""Concurrency utilities, task queues, and dynamic core budget management.
+
+Besides the legacy integer-based :class:`CoreBudgetPool`, this module provides
+CPU-set leases: :class:`CoreLease` (which concrete cores/CPUs a task owns),
+:class:`CpuSetAllocator` (topology-aware allocation: physical cores first,
+best-fit inside one NUMA node, SMT siblings only when SMT use is enabled) and
+:func:`pin_command` (optional ``taskset -c`` pinning of aligner subprocesses).
+"""
 
 from __future__ import annotations
 
 import multiprocessing
 import os
+import shutil
 import sys
 import threading
-from collections.abc import Iterator
+from collections import Counter
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
+from dataclasses import dataclass
 from multiprocessing.context import BaseContext
+
+from .topology import CpuTopology
 
 
 def get_mp_context(force_context: str | None = None) -> BaseContext:
@@ -26,6 +38,266 @@ def get_mp_context(force_context: str | None = None) -> BaseContext:
     return multiprocessing.get_context("fork")
 
 
+# ---------------------------------------------------------------------------
+# CPU-set leases
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CoreLease:
+    """A concrete set of CPUs owned by one task.
+
+    Attributes:
+        core_ids: Dense physical core ids (``CoreInfo.core_id``) touched by the lease.
+        cpu_ids: Sorted OS logical CPU ids the task may use (what ``taskset -c`` gets).
+        numa_node: NUMA node holding most of the lease (lowest id on ties).
+        threads: Number of worker threads the task should use. Equals
+            ``len(cpu_ids)``: one logical CPU per thread.
+        numa_nodes: All NUMA nodes touched (more than one only if the lease had to
+            spill across nodes).
+    """
+
+    core_ids: tuple[int, ...]
+    cpu_ids: tuple[int, ...]
+    numa_node: int
+    threads: int
+    numa_nodes: tuple[int, ...] = ()
+
+    @property
+    def spans_numa(self) -> bool:
+        """True if the lease had to spill across more than one NUMA node."""
+        return len(self.numa_nodes) > 1
+
+
+@dataclass(frozen=True)
+class _Slot:
+    """One allocatable logical CPU of the allocator."""
+
+    cpu_id: int
+    core_id: int
+    node: int
+    rank: int  # position of the CPU inside its physical core (0 = primary thread)
+
+
+class CpuSetAllocator:
+    """Thread-safe, topology-aware allocator of :class:`CoreLease` objects.
+
+    Rules:
+
+    * The allocation unit is the primary logical CPU of each physical core. SMT
+      siblings are only allocatable when ``use_smt`` is true, so by default two
+      leases never share a physical core.
+    * Physical cores first: slots on fully idle cores are preferred (and, with
+      SMT enabled, siblings of an idle core before siblings of a busy core).
+    * Best fit inside one NUMA node: the node with the *fewest* free slots that
+      still fits the request is chosen. Only when no single node fits does the
+      lease spill across nodes (largest free node first, fewest nodes).
+    * Allocation is all-or-nothing and never blocks; callers wait on their own
+      condition and retry after a release.
+    """
+
+    def __init__(
+        self,
+        topology: CpuTopology,
+        use_smt: bool = False,
+        max_slots: int | None = None,
+    ) -> None:
+        self.topology = topology
+        self.use_smt = bool(use_smt)
+        slots: list[_Slot] = []
+        for core in topology.cores:
+            cpus = core.cpu_ids if core.cpu_ids else (core.core_id,)
+            usable = cpus if self.use_smt else cpus[:1]
+            for rank, cpu in enumerate(usable):
+                slots.append(_Slot(cpu, core.core_id, core.numa_node, rank))
+        if max_slots is not None and 0 < max_slots < len(slots):
+            slots = sorted(slots, key=lambda s: (s.rank, s.node, s.core_id))[:max_slots]
+        slots.sort(key=lambda s: (s.node, s.core_id, s.rank))
+        if not slots:
+            slots = [_Slot(0, 0, 0, 0)]
+        self._slots = slots
+        self._by_cpu = {s.cpu_id: i for i, s in enumerate(slots)}
+        self._free: set[int] = set(range(len(slots)))
+        self._busy_on_core: Counter[int] = Counter()
+        self._lock = threading.Lock()
+
+    @property
+    def total_slots(self) -> int:
+        """Number of allocatable logical CPUs (cores, or hardware threads with SMT)."""
+        return len(self._slots)
+
+    @property
+    def free_count(self) -> int:
+        """Number of currently unleased slots."""
+        with self._lock:
+            return len(self._free)
+
+    def free_cpu_ids(self) -> tuple[int, ...]:
+        """Sorted OS CPU ids that are currently free."""
+        with self._lock:
+            return tuple(sorted(self._slots[i].cpu_id for i in self._free))
+
+    def try_allocate(self, threads: int) -> CoreLease | None:
+        """Lease ``threads`` CPUs, or return ``None`` if not enough are free."""
+        n = max(1, int(threads))
+        with self._lock:
+            if n > len(self._free):
+                return None
+            chosen = self._choose(n)
+            for i in chosen:
+                self._free.discard(i)
+                self._busy_on_core[self._slots[i].core_id] += 1
+            return self._make_lease(chosen)
+
+    def release(self, lease: CoreLease) -> None:
+        """Return a lease's CPUs to the free set (unknown/duplicate CPUs ignored)."""
+        with self._lock:
+            for cpu in lease.cpu_ids:
+                i = self._by_cpu.get(cpu)
+                if i is None or i in self._free:
+                    continue
+                self._free.add(i)
+                core = self._slots[i].core_id
+                self._busy_on_core[core] -= 1
+                if self._busy_on_core[core] <= 0:
+                    del self._busy_on_core[core]
+
+    # -- internals (call with the lock held) -------------------------------
+
+    def _pick_order(self, idx: int) -> tuple[bool, int, int]:
+        slot = self._slots[idx]
+        return (self._busy_on_core[slot.core_id] > 0, slot.rank, slot.core_id)
+
+    def _choose(self, n: int) -> list[int]:
+        by_node: dict[int, list[int]] = {}
+        for i in sorted(self._free):
+            by_node.setdefault(self._slots[i].node, []).append(i)
+        for members in by_node.values():
+            members.sort(key=self._pick_order)
+
+        def idle_count(members: list[int]) -> int:
+            return sum(
+                1 for i in members if self._busy_on_core[self._slots[i].core_id] == 0
+            )
+
+        # 1) a single node whose fully-idle physical cores can hold the lease
+        fits = [
+            (idle_count(m), node) for node, m in by_node.items() if idle_count(m) >= n
+        ]
+        if fits:
+            return by_node[min(fits)[1]][:n]
+        # 2) a single node with enough free slots (may share cores with SMT)
+        fits = [(len(m), node) for node, m in by_node.items() if len(m) >= n]
+        if fits:
+            return by_node[min(fits)[1]][:n]
+        # 3) spill: fewest nodes, largest free node first
+        chosen: list[int] = []
+        need = n
+        for _node, members in sorted(
+            by_node.items(), key=lambda kv: (-len(kv[1]), kv[0])
+        ):
+            take = members[:need]
+            chosen.extend(take)
+            need -= len(take)
+            if need <= 0:
+                break
+        return chosen
+
+    def _make_lease(self, chosen: list[int]) -> CoreLease:
+        slots = [self._slots[i] for i in chosen]
+        nodes = Counter(s.node for s in slots)
+        primary = min(nodes, key=lambda nd: (-nodes[nd], nd))
+        return CoreLease(
+            core_ids=tuple(sorted({s.core_id for s in slots})),
+            cpu_ids=tuple(sorted(s.cpu_id for s in slots)),
+            numa_node=primary,
+            threads=len(slots),
+            numa_nodes=tuple(sorted(nodes)),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Optional CPU pinning
+# ---------------------------------------------------------------------------
+
+
+def format_cpu_list(cpu_ids: Iterable[int]) -> str:
+    """Format CPU ids as a ``taskset -c`` list, e.g. ``[0,1,2,3,8]`` -> ``"0-3,8"``."""
+    ids = sorted({int(c) for c in cpu_ids})
+    parts: list[str] = []
+    i = 0
+    while i < len(ids):
+        j = i
+        while j + 1 < len(ids) and ids[j + 1] == ids[j] + 1:
+            j += 1
+        parts.append(str(ids[i]) if i == j else f"{ids[i]}-{ids[j]}")
+        i = j + 1
+    return ",".join(parts)
+
+
+def pin_command(
+    cmd: Sequence[str],
+    cpu_ids: Iterable[int] | None,
+    *,
+    platform: str | None = None,
+    which: Callable[[str], str | None] | None = None,
+) -> list[str]:
+    """Prefix ``cmd`` with ``taskset -c <cpus>`` to pin a subprocess to ``cpu_ids``.
+
+    The command is returned unchanged (as a new list) when there is nothing to
+    pin to, when the platform is not Linux, when ``taskset`` is not installed,
+    or when ``cmd`` is already a ``taskset`` invocation. ``platform`` and
+    ``which`` are injectable for tests.
+    """
+    command = list(cmd)
+    cpus = format_cpu_list(cpu_ids) if cpu_ids else ""
+    if not command or not cpus:
+        return command
+    plat = platform if platform is not None else sys.platform
+    if not plat.startswith("linux"):
+        return command
+    finder = which if which is not None else shutil.which
+    taskset = finder("taskset")
+    if not taskset or os.path.basename(command[0]) == "taskset":
+        return command
+    return [taskset, "-c", cpus, *command]
+
+
+def compute_lease(
+    preferred: int,
+    remaining_tasks: int,
+    available: int,
+    total_cores: int,
+    max_cores_per_task: int,
+) -> int | None:
+    """Pure decision logic of :meth:`CoreBudgetPool.lease_cores`.
+
+    Returns the number of cores to take now, or ``None`` if the task has to wait.
+    Shared with the discrete-event simulator so the policy simulated is the policy
+    shipped.
+    """
+    # Solo straggler optimization: lone remaining locus claims all available capacity
+    if remaining_tasks <= 1:
+        return max(1, min(available, max_cores_per_task))
+
+    # A preference larger than the whole pool could never be satisfied (the
+    # "half the quota" escape hatch below would not fire on small pools).
+    preferred = max(1, min(preferred, total_cores))
+
+    # Dynamic fair share expands as remaining tasks drop below core count
+    fair_share = max(1, total_cores // max(1, remaining_tasks))
+    target = max(fair_share, preferred)
+
+    # Standard tasks wait only when saturated (0 cores available). Multi-core
+    # scheduled tasks wait until their quota (or at least half) is free.
+    min_needed = target if (preferred > 1 and remaining_tasks >= total_cores) else 1
+    if available < min_needed and not (
+        preferred > 1 and available >= max(2, target // 2)
+    ):
+        return None
+    return max(1, min(available, target, max_cores_per_task))
+
+
 class CoreBudgetPool:
     """Thread-safe dynamic core budget manager with mathematical water-filling makespan balancing.
 
@@ -41,8 +313,30 @@ class CoreBudgetPool:
         total_tasks: int = 1,
         max_cores_per_task: int | None = None,
         schedule: dict[str, int] | None = None,
+        topology: CpuTopology | None = None,
+        use_smt: bool = False,
     ) -> None:
+        """Create a pool.
+
+        Args:
+            total_cores: Core budget (integer API; unchanged semantics).
+            total_tasks: Number of tasks that will eventually call ``task_completed``.
+            max_cores_per_task: Upper bound for one lease (default ``total_cores``).
+            schedule: Optional per-task preferred core counts (water-filling result).
+            topology: Optional CPU topology enabling concrete CPU-set leases via
+                :meth:`lease_cpuset`. ``total_cores`` is clamped to the number of
+                allocatable slots. Without it a flat topology is built on demand.
+            use_smt: Allow SMT siblings as separate lease units (default: physical
+                cores only, never splitting a core between leases).
+        """
         self.total_cores = max(1, int(total_cores))
+        self._allocator: CpuSetAllocator | None = None
+        if topology is not None:
+            self._allocator = CpuSetAllocator(
+                topology, use_smt=use_smt, max_slots=self.total_cores
+            )
+            self.total_cores = min(self.total_cores, self._allocator.total_slots)
+        self._use_smt = use_smt
         self._remaining_tasks = max(1, int(total_tasks))
         self.max_cores_per_task = (
             max(1, int(max_cores_per_task))
@@ -53,6 +347,36 @@ class CoreBudgetPool:
         self._available_cores = self.total_cores
         self._lock = threading.Lock()
         self._cond = threading.Condition(self._lock)
+
+    @classmethod
+    def from_topology(
+        cls,
+        topology: CpuTopology,
+        total_tasks: int = 1,
+        max_cores_per_task: int | None = None,
+        schedule: dict[str, int] | None = None,
+        use_smt: bool = False,
+    ) -> CoreBudgetPool:
+        """Build a pool whose core budget is the whole (usable) ``topology``."""
+        slots = CpuSetAllocator(topology, use_smt=use_smt).total_slots
+        return cls(
+            total_cores=slots,
+            total_tasks=total_tasks,
+            max_cores_per_task=max_cores_per_task,
+            schedule=schedule,
+            topology=topology,
+            use_smt=use_smt,
+        )
+
+    @property
+    def allocator(self) -> CpuSetAllocator:
+        """The CPU-set allocator (a flat topology is created lazily if none was given)."""
+        with self._lock:
+            if self._allocator is None:
+                self._allocator = CpuSetAllocator(
+                    CpuTopology.flat(self.total_cores), use_smt=False
+                )
+            return self._allocator
 
     @property
     def remaining(self) -> int:
@@ -90,9 +414,9 @@ class CoreBudgetPool:
         work: dict[str, float] = {}
         p_max: dict[str, int] = {}
 
-        for k, (n, l) in tasks_meta.items():
+        for k, (n, length) in tasks_meta.items():
             n_eff = max(1, n)
-            l_eff = max(1, l)
+            l_eff = max(1, length)
 
             # Super-quadratic complexity scaling for ultra-long unanchored loci
             if l_eff >= 1800:
@@ -148,8 +472,7 @@ class CoreBudgetPool:
 
         # True critical stragglers must significantly exceed ideal makespan
         outliers = [
-            k for k in sorted_keys
-            if work[k] > (1.2 * ideal_makespan) and p_max[k] > 1
+            k for k in sorted_keys if work[k] > (1.2 * ideal_makespan) and p_max[k] > 1
         ]
 
         allocations = {k: 1 for k in work}
@@ -189,55 +512,100 @@ class CoreBudgetPool:
         else:
             return 16
 
-    def lease_cores(self, file_size: int = 0, task_id: str | None = None) -> int:
+    def _preferred(self, file_size: int, task_id: str | None) -> int:
         if task_id is not None and task_id in self._schedule:
-            preferred = self._schedule[task_id]
-        else:
-            preferred = self.estimate_preferred_cores(file_size)
+            return self._schedule[task_id]
+        return self.estimate_preferred_cores(file_size)
 
+    def lease_cores(self, file_size: int = 0, task_id: str | None = None) -> int:
+        """Block until cores are available and return how many were leased (int API)."""
+        preferred = self._preferred(file_size, task_id)
         with self._cond:
-            # Solo straggler optimization: lone remaining locus claims all available capacity
-            if self._remaining_tasks <= 1:
-                allocated = min(self._available_cores, self.max_cores_per_task)
-                allocated = max(1, allocated)
-                self._available_cores -= allocated
-                return allocated
-
-            # Dynamic fair share expands as remaining tasks drop below core count
-            fair_share = max(1, self.total_cores // max(1, self._remaining_tasks))
-            target = max(fair_share, preferred)
-
-            # Minimum cores we are willing to accept before proceeding:
-            # Standard tasks wait only when saturated (0 cores available).
-            # Multi-core scheduled tasks wait until their quota (or at least half) is free.
-            min_needed = (
-                target
-                if (preferred > 1 and self._remaining_tasks >= self.total_cores)
-                else 1
-            )
-            while self._available_cores < min_needed:
-                if preferred > 1 and self._available_cores >= max(2, target // 2):
+            while True:
+                allocated = compute_lease(
+                    preferred,
+                    self._remaining_tasks,
+                    self._available_cores,
+                    self.total_cores,
+                    self.max_cores_per_task,
+                )
+                if allocated is not None:
                     break
                 self._cond.wait()
-
-            allocated = min(self._available_cores, target, self.max_cores_per_task)
-            allocated = max(1, allocated)
             self._available_cores -= allocated
             return allocated
 
     def release_cores(self, count: int) -> None:
         with self._cond:
-            self._available_cores = min(
-                self.total_cores, self._available_cores + count
-            )
+            self._available_cores = min(self.total_cores, self._available_cores + count)
             self._cond.notify_all()
 
     @contextmanager
-    def lease(
-        self, file_size: int = 0, task_id: str | None = None
-    ) -> Iterator[int]:
+    def lease(self, file_size: int = 0, task_id: str | None = None) -> Iterator[int]:
         allocated = self.lease_cores(file_size=file_size, task_id=task_id)
         try:
             yield allocated
         finally:
             self.release_cores(allocated)
+
+    # -- CPU-set leases -----------------------------------------------------
+
+    def lease_cpuset(
+        self,
+        file_size: int = 0,
+        task_id: str | None = None,
+        threads: int | None = None,
+    ) -> CoreLease:
+        """Like :meth:`lease_cores` but returns a concrete :class:`CoreLease`.
+
+        The number of cores is decided by exactly the same policy as
+        :meth:`lease_cores` (``threads`` overrides the preferred count). The CPUs
+        come from the pool's topology: physical cores first, best-fit inside a
+        single NUMA node when possible. Release with :meth:`release_lease`.
+        """
+        preferred = (
+            max(1, int(threads))
+            if threads is not None
+            else self._preferred(file_size, task_id)
+        )
+        allocator = self.allocator
+        with self._cond:
+            while True:
+                available = min(self._available_cores, allocator.free_count)
+                wanted = compute_lease(
+                    preferred,
+                    self._remaining_tasks,
+                    available,
+                    self.total_cores,
+                    self.max_cores_per_task,
+                )
+                if wanted is not None and available > 0:
+                    lease = allocator.try_allocate(min(wanted, available))
+                    if lease is not None:
+                        self._available_cores -= lease.threads
+                        return lease
+                self._cond.wait()
+
+    def release_lease(self, lease: CoreLease) -> None:
+        """Return a lease obtained from :meth:`lease_cpuset`."""
+        allocator = self.allocator
+        with self._cond:
+            allocator.release(lease)
+            self._available_cores = min(
+                self.total_cores, self._available_cores + lease.threads
+            )
+            self._cond.notify_all()
+
+    @contextmanager
+    def cpuset_lease(
+        self,
+        file_size: int = 0,
+        task_id: str | None = None,
+        threads: int | None = None,
+    ) -> Iterator[CoreLease]:
+        """Context manager around :meth:`lease_cpuset` / :meth:`release_lease`."""
+        lease = self.lease_cpuset(file_size=file_size, task_id=task_id, threads=threads)
+        try:
+            yield lease
+        finally:
+            self.release_lease(lease)

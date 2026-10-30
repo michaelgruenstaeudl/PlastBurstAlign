@@ -9,7 +9,7 @@ from Bio.SeqFeature import CompoundLocation, FeatureLocation, SeqFeature
 from Bio.SeqRecord import SeqRecord
 
 from .genbank_scanner import fast_read_genbank
-from .helpers import bounded_submit_iterator, split_list
+from .helpers import ordered_bounded_map, split_list
 from .logging_ops import Logger
 from .logging_ops import logger as log
 
@@ -25,6 +25,9 @@ from .seqfeature_ops import (
     ProteinFeature,
 )
 from .task_queue import get_mp_context
+
+# Flattened extraction results: region -> [(record id, description, sequence, file index)]
+FlatRecords = dict[str, list[tuple[str, str, str, int]]]
 
 
 class ExtractAndCollect:
@@ -70,15 +73,15 @@ class ExtractAndCollect:
             log.critical("Undefined extraction mode")
             raise ValueError
 
-    @staticmethod
-    def _worker_wrapper(args_tuple):
-        """Unpacks arguments from the iterator into the static worker."""
-        return ExtractAndCollect._extract_recs_static(*args_tuple)
-
     def extract(self):
         """
         Parses all GenBank flatfiles of a given folder and extracts
         all sequence annotations of the type specified by the user for each flatfile.
+
+        The result is independent of worker completion order: every record carries
+        the position of its source file in `plastid_data.files` (its `file_index`),
+        and the chunk results are committed to the store strictly in submission
+        order through a bounded reorder window.
         """
         log.info(
             f"parsing GenBank flatfiles and extracting their sequence annotations using "
@@ -93,46 +96,24 @@ class ExtractAndCollect:
         mode_str = getattr(self.plastid_data.mode, "mode", str(self.plastid_data.mode))
         collects_proteins = self.plastid_data.mode.collects_proteins()
 
-        # Step 0. Extract first genome in list for feature ordering
-        if self.plastid_data.order == "seq":
-            first_genome = self.plastid_data.files.pop(0)
-
-            res = self._extract_recs_static(
-                [first_genome],
-                mode_str,
-                collects_proteins,
-                self.exclude_cds,
-                self.include_trna,
-                self.include_rrna,
-                self.min_seq_length,
-                self.verbose,
-            )
+        def commit(res) -> None:
             if len(res) == 3:
                 nuc_dict, prot_dict, inv_map = res
             else:
                 nuc_dict, prot_dict = res
                 inv_map = {}
-
             self.plastid_data.add_nucleotides(nuc_dict, inv_map=inv_map)
             self.plastid_data.add_proteins(prot_dict)
 
-        # Step 1. Chunk remaining files for parallel workers
-        # Target 25-40 genomes per chunk to balance IPC serialization and SQLite commit size
-        total_files = len(self.plastid_data.files)
-        target_chunk_size = max(15, min(40, total_files // (self.num_threads * 4) or 15))
-        num_chunks = max(self.num_threads * 2, (total_files + target_chunk_size - 1) // target_chunk_size)
-        file_lists = split_list(self.plastid_data.files, num_chunks)
+        # Position of the first not-yet-processed file in the ordered file list
+        next_file_index = 0
 
-        # Step 2. Use ProcessPoolExecutor to parallelize extraction with bounded queue
-        mp_context = get_mp_context()
-        max_in_flight = self.num_threads * 2
-
-        with ProcessPoolExecutor(
-            max_workers=self.num_threads, mp_context=mp_context
-        ) as executor:
-            args_generator = (
-                (
-                    chunk,
+        # Step 0. Extract first genome in list for feature ordering
+        if self.plastid_data.order == "seq":
+            first_genome = self.plastid_data.files.pop(0)
+            commit(
+                self._extract_recs_static(
+                    [first_genome],
                     mode_str,
                     collects_proteins,
                     self.exclude_cds,
@@ -140,24 +121,57 @@ class ExtractAndCollect:
                     self.include_rrna,
                     self.min_seq_length,
                     self.verbose,
+                    next_file_index,
                 )
-                for chunk in file_lists
             )
-            for _, future in bounded_submit_iterator(
+            next_file_index += 1
+
+        # Step 1. Chunk remaining files for parallel workers
+        # Target 25-40 genomes per chunk to balance IPC serialization and SQLite commit size
+        total_files = len(self.plastid_data.files)
+        target_chunk_size = max(
+            15, min(40, total_files // (self.num_threads * 4) or 15)
+        )
+        num_chunks = max(
+            self.num_threads * 2,
+            (total_files + target_chunk_size - 1) // target_chunk_size,
+        )
+        file_lists = split_list(self.plastid_data.files, num_chunks)
+
+        # Chunks are contiguous slices of the file list; remember where each starts
+        chunk_args: list[tuple] = []
+        for chunk in file_lists:
+            if chunk:
+                chunk_args.append(
+                    (
+                        chunk,
+                        mode_str,
+                        collects_proteins,
+                        self.exclude_cds,
+                        self.include_trna,
+                        self.include_rrna,
+                        self.min_seq_length,
+                        self.verbose,
+                        next_file_index,
+                    )
+                )
+            next_file_index += len(chunk)
+
+        # Step 2. Use ProcessPoolExecutor to parallelize extraction with a bounded
+        # queue; results are committed in submission order (deterministic row order)
+        mp_context = get_mp_context()
+        max_in_flight = self.num_threads * 2
+
+        with ProcessPoolExecutor(
+            max_workers=self.num_threads, mp_context=mp_context
+        ) as executor:
+            for _, future in ordered_bounded_map(
                 executor,
                 self._worker_wrapper,
-                args_generator,
-                max_in_flight=max_in_flight,
+                chunk_args,
+                window=max_in_flight,
             ):
-                res = future.result()
-                if len(res) == 3:
-                    nuc_dict, prot_dict, inv_map = res
-                else:
-                    nuc_dict, prot_dict = res
-                    inv_map = {}
-
-                self.plastid_data.add_nucleotides(nuc_dict, inv_map=inv_map)
-                self.plastid_data.add_proteins(prot_dict)
+                commit(future.result())
 
         # Step 3. Stop execution if no nucleotides were extracted (O(1) DB query)
         if len(self.plastid_data.nucleotides) == 0:
@@ -174,8 +188,17 @@ class ExtractAndCollect:
         include_rrna: bool,
         min_seq_length: int,
         verbose: bool,
-    ) -> tuple[dict[str, list[tuple[str, str, str]]] | None, dict[str, list[tuple[str, str, str]]] | None, dict[str, str]]:
-        """Static worker function isolated from sqlite connections."""
+        start_index: int = 0,
+    ) -> tuple[FlatRecords | None, FlatRecords | None, dict[str, str]]:
+        """Static worker function isolated from sqlite connections.
+
+        Args:
+            files: GenBank files of this chunk, a contiguous slice of the ordered
+                input file list.
+            start_index: Position of `files[0]` in the ordered input file list; the
+                i-th file's records are tagged with `file_index = start_index + i`
+                (fourth tuple element) so the store can order rows deterministically.
+        """
 
         class MockMode:
             def __init__(self, mode: str, collects: bool):
@@ -220,33 +243,40 @@ class ExtractAndCollect:
                 )
 
         Logger.reinitialize_logger(verbose)
-        nuc_dict = IntergenicDict() if mode_str == "SelectMode.IGS" else PlastidDict()
-        prot_dict = PlastidDict() if collects_proteins else None
-
-        for f in files:
-            extract_rec(f, nuc_dict, prot_dict)
+        is_igs = mode_str == "SelectMode.IGS"
 
         # Flatten records into lightweight primitive tuples to eliminate IPC pickling overhead
-        def _flatten_pdict(pdict: PlastidDict | None):
+        def _flatten_into(
+            flat: FlatRecords, pdict: PlastidDict | None, file_index: int
+        ) -> None:
             if not pdict:
-                return None
-            flat: dict[str, list[tuple[str, str, str]]] = {}
+                return
             for k, recs in pdict.items():
-                flat[k] = [
+                flat.setdefault(k, []).extend(
                     (
                         str(r.id) if r.id is not None else "",
                         r.description or "",
                         str(r.seq),
+                        file_index,
                     )
                     for r in recs
-                ]
-            return flat
+                )
 
-        flat_nuc = _flatten_pdict(nuc_dict)
-        flat_prot = _flatten_pdict(prot_dict)
-        inv_map = getattr(nuc_dict, "feat_name_inv_map", {})
+        flat_nuc: FlatRecords = {}
+        flat_prot: FlatRecords = {}
+        inv_map: dict[str, str] = {}
 
-        return flat_nuc, flat_prot, inv_map
+        # Every file is extracted into its own dictionaries so that each record can
+        # be tagged with the position of the file it came from.
+        for offset, f in enumerate(files):
+            nuc_dict = IntergenicDict() if is_igs else PlastidDict()
+            prot_dict = PlastidDict() if collects_proteins else None
+            extract_rec(f, nuc_dict, prot_dict)
+            _flatten_into(flat_nuc, nuc_dict, start_index + offset)
+            _flatten_into(flat_prot, prot_dict, start_index + offset)
+            inv_map.update(getattr(nuc_dict, "feat_name_inv_map", {}))
+
+        return flat_nuc or None, flat_prot or None, inv_map
 
     @staticmethod
     def _worker_wrapper(args_tuple):
@@ -271,7 +301,11 @@ class ExtractAndCollect:
 
             # Step 1. Extract nucleotide sequence of each gene and filter against min_seq_length
             gene = GeneFeature(rec, feature)
-            if gene.seq_obj is None or len(gene.seq_obj) < self.min_seq_length or self._is_region_excluded(gene.feat_name):
+            if (
+                gene.seq_obj is None
+                or len(gene.seq_obj) < self.min_seq_length
+                or self._is_region_excluded(gene.feat_name)
+            ):
                 continue
 
             # Step 2. Translate nucleotide sequence to protein
@@ -584,7 +618,10 @@ class FeatureRearranger:
             self._compound_features.extend(
                 f for f in self._features if type(f.location) is CompoundLocation
             )
-            self._features = [
+            # in place: the caller iterates the very list that was passed in, so
+            # rebinding `self._features` would silently drop every trans-spliced
+            # gene that is re-inserted below
+            self._features[:] = [
                 f for f in self._features if f not in self._compound_features
             ]
             self._compounds_removed = True
@@ -868,7 +905,9 @@ class ExonSpliceInsertor:
             gene_start = min(gene_start, previous.feature.location.start)
             self.feat_rearr.remove(previous)
             # elements in list will shift to left, so update index
-            insert.index -= 1
+            # (`FeatureTuple` is an immutable NamedTuple: `insert.index -= 1` raised
+            # AttributeError and discarded every gene of the genome)
+            insert = insert._replace(index=insert.index - 1)
             is_merged = True
 
         # perform insertion if needed

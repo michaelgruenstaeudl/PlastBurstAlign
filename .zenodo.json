@@ -1,0 +1,39 @@
+{
+  "title": "PlastBurstAlign: scalable extraction and alignment of plastid genome regions",
+  "upload_type": "software",
+  "access_right": "open",
+  "license": "BSD-3-Clause",
+  "language": "eng",
+  "description": "<p>PlastBurstAlign extracts genes, introns, intergenic spacers and RNA genes from hundreds to thousands of plastid genomes (GenBank flat files), aligns every homologous region in parallel with MAFFT, MUSCLE or Clustal Omega (or a built-in fallback aligner) and concatenates the alignments into a partitioned supermatrix, within bounded memory. It ships a Python API, a command-line interface and PlastBench, a reproducible benchmark suite.</p>",
+  "creators": [
+    {
+      "name": "Hamitouche, Thanina"
+    },
+    {
+      "name": "Gruenstaeudl, Michael"
+    }
+  ],
+  "keywords": [
+    "bioinformatics",
+    "plastid genome",
+    "plastome",
+    "chloroplast",
+    "multiple sequence alignment",
+    "supermatrix",
+    "phylogenomics"
+  ],
+  "related_identifiers": [
+    {
+      "identifier": "https://github.com/michaelgruenstaeudl/PlastBurstAlign",
+      "relation": "isSupplementTo",
+      "scheme": "url",
+      "resource_type": "software"
+    },
+    {
+      "identifier": "10.5281/zenodo.17137737",
+      "relation": "references",
+      "scheme": "doi",
+      "resource_type": "dataset"
+    }
+  ]
+}

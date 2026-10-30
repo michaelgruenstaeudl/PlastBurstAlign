@@ -28,9 +28,17 @@ class ClusterExecutionError(ClusterError):
 
 @dataclass
 class PartitionInfo:
+    """One worker's share of the loci.
+
+    `estimated_bytes` is the cumulative partition weight in the unit given by
+    `weight_kind`: input FASTA bytes (`"bytes"`, the file-size fallback) or the
+    alignment work estimate N * L^alpha (`"work"`).
+    """
+
     partition_id: int
     regions: list[str]
     estimated_bytes: int
+    weight_kind: str = "bytes"
 
 
 @dataclass
@@ -76,12 +84,44 @@ class ClusterPartitionEngine:
     """Partitions alignment tasks across cluster workers using Greedy LPT bin packing."""
 
     @staticmethod
-    def compute_region_weights(
+    def estimate_alignment_work(count: int, max_len: int) -> int:
+        """Alignment work estimate W = N * L^alpha (same tiers as the MAFFT heuristic).
+
+        alpha is 2.0 for L < 1000, 2.2 for L < 2500 and 2.4 otherwise.
+        """
+        if count <= 0 or max_len <= 0:
+            return 0
+        if max_len < 1000:
+            alpha = 2.0
+        elif max_len < 2500:
+            alpha = 2.2
+        else:
+            alpha = 2.4
+        return int(round(float(count) * (float(max_len) ** alpha)))
+
+    @classmethod
+    def _weights_and_kind(
+        cls,
         regions: list[str],
         out_dir: str,
-        prefix: str = "nucl",
-    ) -> dict[str, int]:
-        """Calculates input unaligned file sizes for all regions."""
+        prefix: str,
+        region_summary: dict[str, dict[str, int]] | None,
+    ) -> tuple[dict[str, int], str]:
+        if region_summary:
+            work: dict[str, int] = {}
+            for r in regions:
+                entry = region_summary.get(r)
+                if not isinstance(entry, dict):
+                    break
+                weight = cls.estimate_alignment_work(
+                    int(entry.get("count", 0) or 0), int(entry.get("max_len", 0) or 0)
+                )
+                if weight <= 0:
+                    break
+                work[r] = weight
+            else:
+                return work, "work"
+
         weights: dict[str, int] = {}
         for r in regions:
             fn = os.path.join(out_dir, f"{prefix}_{r}.unalign.fasta")
@@ -89,7 +129,26 @@ class ClusterPartitionEngine:
                 weights[r] = os.path.getsize(fn)
             except OSError:
                 weights[r] = 0
-        return weights
+        return weights, "bytes"
+
+    @classmethod
+    def compute_region_weights(
+        cls,
+        regions: list[str],
+        out_dir: str,
+        prefix: str = "nucl",
+        region_summary: dict[str, dict[str, int]] | None = None,
+    ) -> dict[str, int]:
+        """Calculates a scheduling weight for every region.
+
+        If `region_summary` (from `DiskBackedFeatureStore.get_region_summary`) has a
+        usable entry (`count` > 0 and `max_len` > 0) for *every* region, the weights
+        are alignment work estimates N * L^alpha and no unaligned FASTA files need
+        to exist. Otherwise (no summary, or an incomplete one) the weights are the
+        sizes of the existing `<prefix>_<region>.unalign.fasta` files, so that all
+        weights of a run are always in the same unit.
+        """
+        return cls._weights_and_kind(regions, out_dir, prefix, region_summary)[0]
 
     @classmethod
     def partition_regions(
@@ -98,11 +157,14 @@ class ClusterPartitionEngine:
         out_dir: str,
         num_partitions: int,
         prefix: str = "nucl",
+        region_summary: dict[str, dict[str, int]] | None = None,
     ) -> list[PartitionInfo]:
         """Distributes regions across partitions using Greedy LPT multi-bin allocation.
 
-        Tasks are sorted descending by file weight (with alphabetical tie-breaking).
+        Tasks are sorted descending by weight (with alphabetical tie-breaking).
         Each task is placed into the partition with the minimum cumulative weight.
+        Weights come from `region_summary` (work estimate N * L^alpha) when it covers
+        all regions, else from unaligned file sizes (see `compute_region_weights`).
         """
         if num_partitions <= 0:
             raise ValueError(f"num_partitions must be positive (got {num_partitions})")
@@ -116,11 +178,13 @@ class ClusterPartitionEngine:
         # Clamp partitions if regions < requested partitions
         actual_num_partitions = min(num_partitions, len(regions))
 
-        weights = cls.compute_region_weights(regions, out_dir, prefix=prefix)
+        weights, weight_kind = cls._weights_and_kind(
+            regions, out_dir, prefix, region_summary
+        )
         # Sort descending by weight, ascending by name for deterministic scheduling
         sorted_regions = sorted(regions, key=lambda k: (-weights.get(k, 0), k))
 
-        # Min-heap storing tuples: (cumulative_bytes, partition_index)
+        # Min-heap storing tuples: (cumulative_weight, partition_index)
         heap: list[tuple[int, int]] = [(0, i) for i in range(actual_num_partitions)]
         heapq.heapify(heap)
 
@@ -142,6 +206,7 @@ class ClusterPartitionEngine:
                 partition_id=i,
                 regions=partition_assignments[i],
                 estimated_bytes=partition_weights[i],
+                weight_kind=weight_kind,
             )
             for i in range(actual_num_partitions)
         ]

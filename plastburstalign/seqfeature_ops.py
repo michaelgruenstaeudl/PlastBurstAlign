@@ -1,5 +1,6 @@
 import os
 from collections import OrderedDict, defaultdict
+from re import compile as re_compile
 from re import findall, match, sub
 from typing import Any, ClassVar, Optional
 
@@ -9,11 +10,29 @@ from Bio.Seq import Seq
 from Bio.SeqFeature import ExactPosition, FeatureLocation, SeqFeature
 from Bio.SeqRecord import SeqRecord
 
+from .extraction_report import ExtractionReport
 from .logging_ops import logger as log
 from .storage import DiskBackedFeatureStore, FeatureStoreView
+from .user_parameters import SelectMode
+
+# Anything outside the IUPAC nucleotide alphabet cannot be aligned: such a feature
+# is skipped (and reported) instead of poisoning its region.
+_INVALID_RESIDUES = re_compile(r"[^ACGTURYSWKMBDHVNacgturyswkmbdhvn]")
+# Region names become file names; real gene names are far shorter.
+MAX_REGION_NAME_CHARS = 100
 
 
 class PlastidData:
+    mode: SelectMode
+    files: list[str]
+    num_taxa: int
+    order: str
+    store: DiskBackedFeatureStore
+    nucleotides: FeatureStoreView
+    proteins: FeatureStoreView | None
+    order_map: dict[str, int]
+    extraction_report: ExtractionReport
+
     def __init__(self, user_params: dict[str, Any]):
         """
         Data structure to hold the extracted annotations.
@@ -22,6 +41,8 @@ class PlastidData:
         self._set_mode(user_params)
         self._set_files(user_params)
         self._set_order_fun(user_params)
+        # filled by `ExtractAndCollect.extract()`; empty until then
+        self.extraction_report = ExtractionReport()
 
         db_path = os.path.join(user_params.get("out_dir", "."), "feature_store.db")
         self.store = DiskBackedFeatureStore(db_path)
@@ -30,7 +51,7 @@ class PlastidData:
         self._set_proteins()
 
     def _set_mode(self, user_params: dict[str, Any]):
-        self.mode = user_params.get("select_mode")
+        self.mode = user_params.get("select_mode")  # type: ignore[assignment]
 
     def _set_nucleotides(self):
         self.nucleotides = FeatureStoreView(self.store, "nucl")
@@ -43,10 +64,29 @@ class PlastidData:
         )
 
     def _set_files(self, user_params: dict[str, Any]):
+        """Collects the input files in a deterministic (sorted by name) order.
+
+        `os.listdir` order is filesystem dependent; the position of a file in this
+        list becomes the `file_index` of its records and thereby the row order of
+        every alignment and of the concatenated supermatrix.
+
+        Cluster worker and finalizer runs operate on the existing feature store
+        only, so a missing input directory is tolerated there.
+        """
+        in_dir = user_params.get("in_dir")
+        is_cluster_worker_or_final = (
+            user_params.get("align_partition") is not None
+            or user_params.get("finalize_slurm") is True
+        )
+        try:
+            names = os.listdir(in_dir)
+        except OSError:
+            if not is_cluster_worker_or_final:
+                raise
+            names = []
+        fileext = user_params.get("fileext")
         self.files = [
-            os.path.join(user_params.get("in_dir"), f)
-            for f in os.listdir(user_params.get("in_dir"))
-            if f.endswith(user_params.get("fileext"))
+            os.path.join(in_dir, f) for f in sorted(names) if f.endswith(fileext)
         ]
         self.num_taxa = len(self.files)
 
@@ -64,9 +104,7 @@ class PlastidData:
             inv_map = getattr(pdict, "feat_name_inv_map", {}) if is_igs else None
 
         with self.store.transaction():
-            self.store.add_pdict(
-                pdict, seq_type="nucl", inv_map=inv_map
-            )
+            self.store.add_pdict(pdict, seq_type="nucl", inv_map=inv_map)
 
     def add_proteins(self, pdict: Any) -> None:
         """Merges extracted proteins into the disk store."""
@@ -348,12 +386,30 @@ class PlastidFeature:
 
     def _set_seq_obj(self, record: SeqRecord):
         try:
-            self.seq_obj = self.feature.extract(record).seq
+            seq = self.feature.extract(record).seq
+            bad = _INVALID_RESIDUES.search(str(seq))
+            if bad:
+                raise ValueError(
+                    f"invalid nucleotide character {bad.group()!r} at position"
+                    f" {bad.start() + 1} of the feature"
+                )
+            self.seq_obj = seq
         except Exception as e:
             self._set_exception(e)
 
     def _set_seq_name(self):
         self.seq_name = f"{self.feat_name}_{self.rec_name}"
+        if (
+            isinstance(self.feat_name, str)
+            and len(self.feat_name) > MAX_REGION_NAME_CHARS
+        ):
+            self.seq_obj = None
+            self._set_exception(
+                ValueError(
+                    f"region name of {len(self.feat_name)} characters exceeds the"
+                    f" {MAX_REGION_NAME_CHARS} character limit"
+                )
+            )
 
     def _set_exception(self, exception: Exception | None = None):
         if exception is None:
@@ -424,6 +480,8 @@ class GeneFeature(PlastidFeature):
         """
         Accesses if a proper reading frame exists for the gene.
         """
+        if self.seq_obj is None:  # extraction failed; the exception is recorded
+            return
         trim_char = len(self.seq_obj) % 3
         if trim_char > 0 and self.seq_obj[:3] == "ATG":
             self.seq_obj = self.seq_obj[:-trim_char]

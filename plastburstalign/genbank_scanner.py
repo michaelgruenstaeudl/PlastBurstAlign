@@ -4,11 +4,41 @@ High-throughput, low-allocation scanner for GenBank flatfiles.
 Extracts record metadata (id, name, description), nucleotide sequence,
 and target genomic features (CDS, gene, tRNA, rRNA) with minimal object
 instantiation and zero-copy string slicing.
+
+Robustness
+----------
+Valid input is parsed exactly as before: the strict fast path first, then
+(transparently) BioPython's ``SeqIO.read`` if the fast path rejects the file.
+Only when *both* parsers fail is the input treated as damaged:
+
+* the fast scanner is re-run in *lenient* mode, in which a feature whose
+  location cannot be parsed is skipped instead of failing the whole file. The
+  number of skipped features is recorded in ``record.annotations`` as
+  ``pba_skipped_features`` (with up to ``MAX_SKIP_DETAILS`` descriptions, one per
+  line, in ``pba_skipped_feature_details``); the keys are absent for clean records;
+* if that does not help either (no ``LOCUS``/``FEATURES``/``ORIGIN``, empty or
+  unreadable file, ...) :class:`GenBankParseError` is raised with the path and a
+  one-line reason.
+
+Pathological input is bounded instead of being allowed to hang or blow up
+(documented module constants, far above anything a plastome needs):
+
+* ``MAX_FILE_BYTES``: larger files are rejected (:class:`GenBankParseError`,
+  stage ``read``);
+* ``MAX_LOCATION_PARTS`` / ``MAX_LOCATION_CHARS``: a feature location with more
+  parts or characters is skipped (and BioPython's unbounded location parser is
+  not consulted for it);
+* ``MAX_QUALIFIER_CHARS``: longer qualifier values are truncated (counted in
+  ``pba_truncated_qualifiers``).
+
+Further annotation keys (present only when non-zero): ``pba_extra_records``
+(additional records of a multi-record file, which are ignored as before).
 """
 
 from __future__ import annotations
 
 import logging
+import os
 from os import PathLike
 from typing import TextIO
 
@@ -22,6 +52,56 @@ log = logging.getLogger(__name__)
 _DEFAULT_TARGET_FEATURES = frozenset({"CDS", "gene", "tRNA", "rRNA"})
 _STRIP_SEQ_TRANS = str.maketrans("", "", " 0123456789\r\n\t")
 
+#: Files larger than this are rejected (a plastome flatfile is about 0.4 MB).
+MAX_FILE_BYTES = 128 * 1024 * 1024
+#: Maximum number of parts (``..`` ranges) of one feature location.
+MAX_LOCATION_PARTS = 1000
+#: Maximum length of one feature location string.
+MAX_LOCATION_CHARS = 100_000
+#: Maximum length of one qualifier value; the rest is dropped.
+MAX_QUALIFIER_CHARS = 1_000_000
+#: Maximum number of skipped-feature descriptions kept in the record annotations.
+MAX_SKIP_DETAILS = 50
+
+
+class GenBankParseError(ValueError):
+    """The whole file is unusable as a GenBank record.
+
+    Attributes:
+        path: The file (or stream name).
+        reason: One-line explanation.
+        stage: ``"read"`` if the file could not be read at all (missing,
+            directory, permissions, too large), else ``"parse"``.
+    """
+
+    def __init__(self, path: str, reason: str, *, stage: str = "parse") -> None:
+        self.path = str(path)
+        self.reason = reason
+        self.stage = stage
+        super().__init__(f"{self.path}: {reason}")
+
+    def __reduce__(self):  # keeps path/reason/stage across process boundaries
+        return (_rebuild_parse_error, (self.path, self.reason, self.stage))
+
+
+def _rebuild_parse_error(path: str, reason: str, stage: str) -> GenBankParseError:
+    return GenBankParseError(path, reason, stage=stage)
+
+
+class _LimitExceeded(ValueError):
+    """A documented parser limit was hit (feature skipped, not retried elsewhere)."""
+
+
+def _describe(source: str | PathLike | TextIO) -> str:
+    if isinstance(source, (str, PathLike)):
+        return str(os.fspath(source))
+    return str(getattr(source, "name", "<stream>"))
+
+
+def _short(exc: BaseException, limit: int = 160) -> str:
+    text = " ".join(f"{type(exc).__name__}: {exc}".split())
+    return text if len(text) <= limit else text[: limit - 3] + "..."
+
 
 def fast_read_genbank(
     source: str | PathLike | TextIO,
@@ -31,7 +111,8 @@ def fast_read_genbank(
 
     Extracts record ID, locus name, definition, sequence, and requested
     features. If parsing fails or non-standard formatting is encountered,
-    transparently falls back to BioPython's `SeqIO.read()`.
+    transparently falls back to BioPython's `SeqIO.read()`. If that fails too,
+    damaged features are skipped where possible (see the module docstring).
 
     Args:
         source: File path or open text file handle.
@@ -39,33 +120,83 @@ def fast_read_genbank(
 
     Returns:
         A populated Bio.SeqRecord.SeqRecord.
+
+    Raises:
+        GenBankParseError: The whole file is unusable (unreadable, empty, no
+            record structure, ...).
     """
+    name = _describe(source)
     try:
-        return _scan_genbank_block(source, target_types)
+        text = _read_content(source)
+    except GenBankParseError:
+        raise
     except Exception as exc:
-        log.debug(
-            "FastGenBankScanner fallback on %s: %s",
-            getattr(source, "name", source),
-            exc,
+        detail = (
+            exc.strerror
+            if isinstance(exc, OSError) and exc.strerror
+            else f"{type(exc).__name__}: {exc}"
         )
+        raise GenBankParseError(
+            name, f"cannot read file ({detail})", stage="read"
+        ) from exc
+    if not text.strip():
+        raise GenBankParseError(
+            name, "file is empty" if not text else "file contains only whitespace"
+        )
+
+    try:
+        return _scan_genbank_block(text, target_types)
+    except Exception as exc:
+        fast_exc = exc
+        log.debug("FastGenBankScanner fallback on %s: %s", name, exc)
+
+    bio_exc: Exception | None = None
+    if not isinstance(fast_exc, _LimitExceeded):
         if hasattr(source, "seek"):
             try:
                 source.seek(0)
             except Exception:
                 pass
-        return SeqIO.read(source, "genbank")
+        try:
+            return SeqIO.read(source, "genbank")
+        except Exception as exc:
+            bio_exc = exc
+
+    # Both parsers failed: keep whatever can be read, feature by feature.
+    try:
+        return _scan_genbank_block(text, target_types, skip_bad_features=True)
+    except Exception:
+        reason = _short(fast_exc)
+        if bio_exc is not None:
+            reason += f"; BioPython: {_short(bio_exc)}"
+        raise GenBankParseError(name, reason) from (bio_exc or fast_exc)
 
 
 def _read_content(source: str | PathLike | TextIO) -> str:
     if isinstance(source, (str, PathLike)):
+        size = os.path.getsize(source)
+        if size > MAX_FILE_BYTES:
+            raise GenBankParseError(
+                str(os.fspath(source)),
+                f"file is {size} bytes, larger than the {MAX_FILE_BYTES} byte limit",
+                stage="read",
+            )
         with open(source, "r", encoding="latin-1", errors="replace") as f:
             return f.read()
     content = source.read()
+    if len(content) > MAX_FILE_BYTES:
+        raise GenBankParseError(
+            _describe(source),
+            f"input is {len(content)} characters, larger than the limit",
+            stage="read",
+        )
     return content
 
 
 def _parse_location(loc_str: str, seq_len: int) -> Location:
     """Fast-path location parsing for simple, complement, and compound features."""
+    if loc_str.count(",") >= MAX_LOCATION_PARTS:
+        raise _LimitExceeded(f"location has more than {MAX_LOCATION_PARTS} parts")
     if ".." in loc_str and "(" not in loc_str:
         start_str, end_str = loc_str.split("..", 1)
         if start_str.isdigit() and end_str.isdigit():
@@ -92,10 +223,15 @@ def _parse_location(loc_str: str, seq_len: int) -> Location:
 
 
 def _scan_genbank_block(
-    source: str | PathLike | TextIO,
+    text: str,
     target_types: frozenset[str] | set[str] | None,
+    skip_bad_features: bool = False,
 ) -> SeqRecord:
-    text = _read_content(source)
+    """Scans the first record of ``text``.
+
+    With ``skip_bad_features`` a feature whose location cannot be parsed is
+    dropped (and counted) instead of raising.
+    """
     if not text.startswith("LOCUS"):
         # Not a standard GenBank file; trigger fallback
         raise ValueError("File does not start with LOCUS")
@@ -157,19 +293,41 @@ def _scan_genbank_block(
 
     # 3. Features extraction
     features: list[SeqFeature] = []
+    skipped: list[str] = []
+    n_skipped = 0
+    truncated_quals = 0
     feat_text = text[feat_idx:orig_idx]
     feat_lines = feat_text.splitlines()
 
     curr_type: str | None = None
     curr_loc_str: str = ""
+    loc_overflow = False
     curr_quals: dict[str, list[str]] = {}
     curr_qual_key: str | None = None
     curr_qual_val_parts: list[str] = []
+    qual_chars = 0
     in_quoted_qualifier = False
     keep_curr_feature = False
 
+    def clip(value: str) -> str:
+        nonlocal truncated_quals
+        if len(value) > MAX_QUALIFIER_CHARS:
+            truncated_quals += 1
+            return value[:MAX_QUALIFIER_CHARS]
+        return value
+
+    def add_qual_part(part: str) -> None:
+        nonlocal qual_chars, truncated_quals
+        if qual_chars > MAX_QUALIFIER_CHARS:
+            return
+        qual_chars += len(part)
+        if qual_chars > MAX_QUALIFIER_CHARS:
+            truncated_quals += 1
+            return
+        curr_qual_val_parts.append(part)
+
     def flush_qual():
-        nonlocal curr_qual_key, curr_qual_val_parts, in_quoted_qualifier
+        nonlocal curr_qual_key, curr_qual_val_parts, in_quoted_qualifier, qual_chars
         if curr_qual_key is not None:
             val = " ".join(curr_qual_val_parts).strip()
             if val.startswith('"') and val.endswith('"') and len(val) >= 2:
@@ -181,18 +339,38 @@ def _scan_genbank_block(
             curr_quals.setdefault(curr_qual_key, []).append(val)
             curr_qual_key = None
             curr_qual_val_parts = []
+            qual_chars = 0
             in_quoted_qualifier = False
 
     def flush_feat():
         nonlocal curr_type, curr_loc_str, curr_quals, keep_curr_feature
+        nonlocal loc_overflow, n_skipped
         flush_qual()
         if curr_type is not None and keep_curr_feature:
-            loc = _parse_location(curr_loc_str, seq_len)
-            features.append(
-                SeqFeature(location=loc, type=curr_type, qualifiers=curr_quals)
-            )
+            try:
+                if loc_overflow:
+                    raise _LimitExceeded(
+                        f"location longer than {MAX_LOCATION_CHARS} characters"
+                    )
+                loc = _parse_location(curr_loc_str, seq_len)
+            except Exception as exc:
+                if not skip_bad_features:
+                    raise
+                n_skipped += 1
+                if len(skipped) < MAX_SKIP_DETAILS:
+                    shown = (
+                        curr_loc_str
+                        if len(curr_loc_str) <= 60
+                        else (curr_loc_str[:57] + "...")
+                    )
+                    skipped.append(f"{curr_type} {shown}: {_short(exc, 120)}")
+            else:
+                features.append(
+                    SeqFeature(location=loc, type=curr_type, qualifiers=curr_quals)
+                )
         curr_type = None
         curr_loc_str = ""
+        loc_overflow = False
         curr_quals = {}
         keep_curr_feature = False
 
@@ -202,7 +380,11 @@ def _scan_genbank_block(
             feature_type = line[5:21].strip()
             keep_curr_feature = target_types is None or feature_type in target_types
             curr_type = feature_type
-            curr_loc_str = line[21:].strip()
+            first_loc = line[21:].strip()
+            if len(first_loc) > MAX_LOCATION_CHARS:
+                loc_overflow = True
+            else:
+                curr_loc_str = first_loc
             continue
 
         if not keep_curr_feature:
@@ -214,10 +396,10 @@ def _scan_genbank_block(
 
         if in_quoted_qualifier:
             if stripped.endswith('"') and not stripped.endswith('\\"'):
-                curr_qual_val_parts.append(stripped[:-1])
+                add_qual_part(stripped[:-1])
                 flush_qual()
             else:
-                curr_qual_val_parts.append(stripped)
+                add_qual_part(stripped)
             continue
 
         if stripped.startswith("/"):
@@ -228,19 +410,33 @@ def _scan_genbank_block(
                 v = v.strip()
                 if v.startswith('"'):
                     if v.endswith('"') and len(v) > 1:
-                        curr_quals.setdefault(k, []).append(v[1:-1])
+                        curr_quals.setdefault(k, []).append(clip(v[1:-1]))
                     else:
                         curr_qual_key = k
-                        curr_qual_val_parts = [v[1:]]
+                        curr_qual_val_parts = [clip(v[1:])]
+                        qual_chars = len(curr_qual_val_parts[0])
                         in_quoted_qualifier = True
                 else:
-                    curr_quals.setdefault(k, []).append(v)
+                    curr_quals.setdefault(k, []).append(clip(v))
             else:
                 curr_quals.setdefault(stripped[1:].strip(), []).append("")
         elif curr_qual_key is None:
-            curr_loc_str += stripped
+            if len(curr_loc_str) + len(stripped) > MAX_LOCATION_CHARS:
+                loc_overflow = True
+            else:
+                curr_loc_str += stripped
 
     flush_feat()
+
+    annotations: dict[str, str | int] = {}
+    if n_skipped:
+        annotations["pba_skipped_features"] = n_skipped
+        annotations["pba_skipped_feature_details"] = "\n".join(skipped)
+    if truncated_quals:
+        annotations["pba_truncated_qualifiers"] = truncated_quals
+    extra_records = text.count("\nLOCUS ", end_idx)
+    if extra_records:
+        annotations["pba_extra_records"] = extra_records
 
     return SeqRecord(
         Seq(seq_str),
@@ -248,4 +444,5 @@ def _scan_genbank_block(
         name=rec_name,
         description=description,
         features=features,
+        annotations=annotations,
     )

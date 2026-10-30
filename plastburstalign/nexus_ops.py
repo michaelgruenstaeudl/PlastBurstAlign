@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import os
 from pathlib import Path
+from typing import Any
 
 from Bio.Nexus.Nexus import Nexus as NexusAlignment
 from Bio.Seq import Seq
@@ -12,6 +13,7 @@ from Bio.Seq import Seq
 
 class ConcatenationError(RuntimeError):
     """Raised when alignment concatenation fails."""
+
 
 class IncrementalNexusAccumulator:
     """Incrementally accumulates individual Nexus alignment matrices into a single
@@ -43,8 +45,11 @@ class IncrementalNexusAccumulator:
                 self.combined.charpartitions = {
                     "combined": {name: list(range(self.combined.nchar))}
                 }
+                combined_matrix = self.combined.matrix
+                if combined_matrix is None:
+                    raise ValueError("Nexus alignment has no data matrix")
                 self.chunk_buffer = {
-                    t: [str(seq)] for t, seq in self.combined.matrix.items()
+                    t: [str(seq)] for t, seq in combined_matrix.items()
                 }
                 return
             else:
@@ -62,13 +67,9 @@ class IncrementalNexusAccumulator:
                 comb.translate = None
                 comb.charsets = {}
                 comb.taxsets = {}
-                comb.charpartitions = {
-                    "combined": {name: list(range(comb.nchar))}
-                }
+                comb.charpartitions = {"combined": {name: list(range(comb.nchar))}}
                 self.combined = comb
-                self.chunk_buffer = {
-                    t: [str(seq)] for t, seq in comb.matrix.items()
-                }
+                self.chunk_buffer = {t: [str(seq)] for t, seq in comb.matrix.items()}
                 return
 
         comb = self.combined
@@ -128,11 +129,12 @@ class IncrementalNexusAccumulator:
         comb.charpartitions["combined"][name] = list(
             range(comb.nchar, comb.nchar + m.nchar)
         )
-        if getattr(m, "charlabels", None):
+        m_charlabels = getattr(m, "charlabels", None)
+        if m_charlabels:
             if not comb.charlabels:
                 comb.charlabels = {}
             comb.charlabels.update(
-                {comb.nchar + i: label for i, label in m.charlabels.items()}
+                {comb.nchar + i: label for i, label in m_charlabels.items()}
             )
         comb.nchar += m.nchar
         comb.ntax += len(m_only)
@@ -153,6 +155,7 @@ class IncrementalNexusAccumulator:
             charsets[c] = partition
         return self.combined
 
+
 def fast_write_fasta(
     filename: str | Path,
     matrix: dict[str, Any],
@@ -165,6 +168,7 @@ def fast_write_fasta(
         for t in order:
             f.write(f">{t}\n")
             f.write(f"{str(matrix[t])}\n")
+
 
 def fast_write_nexus(
     filename: str | Path,
@@ -205,6 +209,8 @@ def fast_write_nexus(
             part_list = ", ".join(f"{name}:{name}" for name in parts.keys())
             f.write(f"  CHARPARTITION combined = {part_list};\n")
             f.write("END;\n")
+
+
 def fast_write_raxml_partitions(
     filename: str | Path,
     charpartitions: dict[str, dict[str, list[int]]] | None,
@@ -252,3 +258,35 @@ def fast_write_nexus_partitions(
         part_list = ", ".join(f"{name}:{name}" for name in parts.keys())
         f.write(f"  CHARPARTITION combined = {part_list};\n")
         f.write("END;\n")
+
+
+# ---------------------------------------------------------------------------
+# Thin, additive formatting helpers shared with `supermatrix.SupermatrixBuilder`.
+# They reproduce the exact text layout of `fast_write_nexus`; the legacy
+# functions above are intentionally left untouched.
+# ---------------------------------------------------------------------------
+
+NEXUS_DATA_FOOTER = "  ;\nEND;\n"
+"""Text closing the ``MATRIX`` and ``DATA`` blocks written by `fast_write_nexus`."""
+
+
+def nexus_data_header(
+    ntax: int,
+    nchar: int,
+    datatype: str = "dna",
+    gap: str = "-",
+    missing: str = "?",
+) -> str:
+    """Return the NEXUS preamble up to and including ``MATRIX`` (legacy layout)."""
+    return (
+        "#NEXUS\n\n"
+        "BEGIN DATA;\n"
+        f"  DIMENSIONS NTAX={ntax} NCHAR={nchar};\n"
+        f"  FORMAT DATATYPE={datatype.upper()} GAP={gap} MISSING={missing};\n"
+        "  MATRIX\n"
+    )
+
+
+def nexus_row_prefix(taxon: str, label_width: int) -> str:
+    """Return the label column of one matrix row (taxon padded to ``label_width + 4``)."""
+    return f"    {taxon.ljust(label_width + 4)}"

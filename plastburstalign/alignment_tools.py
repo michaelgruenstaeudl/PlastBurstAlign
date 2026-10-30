@@ -3,14 +3,75 @@ Generic alignment tool interface and concrete implementations.
 Supports multiple alignment tools (MAFFT, Clustal Omega, etc.)
 """
 
+from __future__ import annotations
+
 import os
 import shutil
 import subprocess
+import tempfile
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional
+from collections.abc import Iterable, Sequence
+from typing import IO, Any, Dict, List, NamedTuple, Optional
 
 from .ephemeral_engine import EphemeralScratchManager
 from .logging_ops import logger as log
+from .strategy import (
+    OVERRIDE_KEYS,
+    AlignmentStrategy,
+    AlignmentTier,
+    determine_alignment_strategy,
+    normalize_alphabet,
+)
+from .strategy_constants import DEFAULT_CONSTANTS
+
+#: Translation table dropping everything that is not a residue (stop, gaps, space).
+_NON_RESIDUES = str.maketrans("", "", "*-. \t\r\n")
+
+
+def _read_fasta_records(path: str) -> list[tuple[str, str]]:
+    """``[(header_line, sequence), ...]`` of a FASTA file (header without '>')."""
+    records: list[tuple[str, list[str]]] = []
+    with open(path, encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith(">"):
+                records.append((line[1:], []))
+            elif records:
+                records[-1][1].append(line)
+    return [(header, "".join(parts)) for header, parts in records]
+
+
+def _write_fasta_records(path: str, records: Iterable[tuple[str, str]]) -> None:
+    """Write ``(name, sequence)`` records, one line per sequence."""
+    with open(path, "w", encoding="utf-8") as handle:
+        for name, seq in records:
+            handle.write(f">{name}\n{seq}\n")
+
+
+def _read_aligned_fasta(path: str) -> dict[str, str]:
+    """``{first header token: aligned row}`` of a FASTA alignment."""
+    rows: dict[str, list[str]] = {}
+    current: list[str] | None = None
+    with open(path, encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith(">"):
+                key = line[1:].split(None, 1)[0] if len(line) > 1 else ""
+                current = rows.setdefault(key, [])
+            elif current is not None:
+                current.append(line)
+    return {key: "".join(parts) for key, parts in rows.items()}
+
+
+def _write_wrapped(handle: IO[str], header: str, row: str, width: int = 60) -> None:
+    """Write one FASTA record wrapped like MAFFT does (60 columns)."""
+    handle.write(f">{header}\n")
+    for start in range(0, len(row), width):
+        handle.write(row[start : start + width] + "\n")
 
 
 class AlignmentTool(ABC):
@@ -32,11 +93,13 @@ class AlignmentTool(ABC):
             tool_path: Optional path to the alignment tool executable
         """
         self.user_params = user_params or {}
-        self.exec_path = None
+        self.exec_path: str | None = None
         # self.num_threads = self._set_num_threads(user_params)
         # self.num_threads = "1"  # For debugging, set to 1 to avoid multiprocessing issues"
         self.tool_params = self._get_tool_params(user_params)
-        custom_scratch = self.tool_params.get("scratch_dir", self.user_params.get("scratch_dir"))
+        custom_scratch = self.tool_params.get(
+            "scratch_dir", self.user_params.get("scratch_dir")
+        )
         self.scratch_mgr = EphemeralScratchManager(custom_scratch_dir=custom_scratch)
 
         if tool_path:
@@ -126,11 +189,27 @@ class AlignmentTool(ABC):
         return True
 
 
-class MAFFT(AlignmentTool):
-    """MAFFT alignment tool implementation with adaptive mega-taxa heuristics."""
+class _ResolvedStrategy(NamedTuple):
+    """Sequence statistics and strategy resolved for one MAFFT call."""
 
-    PARTTREE_THRESHOLD_DEFAULT = 1000
-    RETREE1_THRESHOLD_DEFAULT = 5000
+    n_seq: int
+    max_len: int
+    min_len: int | None
+    strategy: AlignmentStrategy
+
+
+class MAFFT(AlignmentTool):
+    """MAFFT alignment tool with a deterministic, work-based strategy.
+
+    The algorithm comes from ``strategy.determine_alignment_strategy`` and is a
+    pure function of ``(N, L_min, L_max, alphabet)`` plus explicit overrides;
+    hardware never influences it. When a PartTree tier is chosen and the locus
+    contains sequences shorter than 6 residues (PartTree aborts on those),
+    :meth:`align` aligns the others with the tier and adds the short ones with
+    ``mafft --addfragments`` (``--add`` for very large N, see
+    :meth:`_align_with_fragments`) instead of falling back to the O(N^2)
+    ``--auto``.
+    """
 
     def _find_tool(self):
         """Search for MAFFT in system PATH."""
@@ -150,7 +229,9 @@ class MAFFT(AlignmentTool):
         max_len = 0
         curr_len = 0
         in_seq = False
-        non_residues = bytes([42, 32, 9, 13, 10, 45, 46])  # ASCII for * space \t \r \n - .
+        non_residues = bytes(
+            [42, 32, 9, 13, 10, 45, 46]
+        )  # ASCII for * space \t \r \n - .
         try:
             with open(input_file, "rb") as f:
                 for line in f:
@@ -186,119 +267,331 @@ class MAFFT(AlignmentTool):
         count, _, _ = MAFFT._scan_fasta_meta(input_file)
         return count
 
+    # ------------------------------------------------------------------
+    # strategy resolution
+    # ------------------------------------------------------------------
+
+    def _adaptive_enabled(self) -> bool:
+        """Whether adaptive heuristics are on (default: True)."""
+        return bool(
+            self.tool_params.get(
+                "adaptive_heuristics",
+                self.user_params.get("adaptive_heuristics", True),
+            )
+        )
+
+    def _explicit_algorithm(self) -> str | None:
+        """The explicitly requested algorithm (anything but ``auto``), if any."""
+        explicit = self.tool_params.get("algorithm")
+        if explicit and explicit != "auto":
+            return str(explicit)
+        return None
+
+    def _strategy_overrides(self) -> dict[str, Any]:
+        """Strategy overrides explicitly present in the tool configuration."""
+        return {
+            key: self.tool_params[key]
+            for key in sorted(OVERRIDE_KEYS)
+            if self.tool_params.get(key) is not None
+        }
+
+    @staticmethod
+    def _detect_alphabet(input_file: str, alphabet: str | None) -> str:
+        """``"prot"`` or ``"nucl"``: the explicit alphabet, else the file prefix."""
+        if alphabet is not None:
+            return normalize_alphabet(alphabet)
+        return "prot" if os.path.basename(input_file).startswith("prot_") else "nucl"
+
+    def _resolve_strategy(
+        self,
+        input_file: str,
+        sequence_count: int | None,
+        max_len: int | None,
+        min_len: int | None,
+        alphabet: str | None,
+    ) -> _ResolvedStrategy:
+        """Fill in unknown sequence statistics (one scan at most) and decide.
+
+        A single scan of ``input_file`` supplies whatever the caller did not
+        pass. ``min_len`` is only needed for the short-sequence guard and is
+        therefore only looked up when a PartTree tier was chosen.
+        """
+        n_seq, max_l, min_l = sequence_count, max_len, min_len
+        file_exists = os.path.exists(input_file)
+        if (n_seq is None or max_l is None) and file_exists:
+            scanned_count, scanned_min, scanned_max = self._scan_fasta_meta(input_file)
+            if n_seq is None:
+                n_seq = scanned_count
+            if max_l is None:
+                max_l = scanned_max
+            if min_l is None:
+                min_l = scanned_min
+        n = n_seq if n_seq is not None else 0
+        longest = max_l if max_l is not None else 0
+        alpha = self._detect_alphabet(input_file, alphabet)
+        overrides = self._strategy_overrides()
+        strategy = determine_alignment_strategy(
+            n, longest, min_l, alphabet=alpha, overrides=overrides
+        )
+        if strategy.uses_parttree and min_l is None and file_exists:
+            # Counts were supplied without a minimum length: scan once for it.
+            min_l = self._scan_fasta_meta(input_file)[1]
+            strategy = determine_alignment_strategy(
+                n, longest, min_l, alphabet=alpha, overrides=overrides
+            )
+        return _ResolvedStrategy(n, longest, min_l, strategy)
+
+    # ------------------------------------------------------------------
+    # command assembly
+    # ------------------------------------------------------------------
+
+    def _assemble_command(
+        self,
+        algorithm_args: Sequence[str],
+        input_file: str,
+        threads: int | None,
+        alphabet: str,
+    ) -> list[str]:
+        """``mafft <algorithm> --thread T [--adjustdirection] [--quiet] <input>``."""
+        cmd: list[str] = [self.exec_path or "mafft", *algorithm_args]
+        # Prioritize dynamically leased threads, falling back to tool_params
+        mafft_threads = (
+            threads if threads is not None else self.tool_params.get("threads", 1)
+        )
+        cmd.extend(["--thread", str(mafft_threads)])
+        # adjustdirection is strictly nucleotide-only and only applied if enabled
+        if alphabet != "prot" and self.tool_params.get("adjustdirection", False):
+            cmd.append("--adjustdirection")
+        if self.tool_params.get("quiet"):
+            cmd.append("--quiet")
+        cmd.append(input_file)
+        return cmd
+
+    def _explicit_algorithm_args(self, explicit_algorithm: str) -> list[str]:
+        """MAFFT arguments of an explicitly requested algorithm."""
+        args: list[str] = []
+        if explicit_algorithm == "localpair":
+            args.append("--localpair")
+        elif explicit_algorithm == "globalpair":
+            args.append("--globalpair")
+        elif explicit_algorithm == "genafpair":
+            args.append("--genafpair")
+        elif explicit_algorithm == "retree":
+            args.extend(["--retree", str(self.tool_params.get("retree", 1))])
+        elif explicit_algorithm == "maxiterate":
+            args.extend(["--maxiterate", str(self.tool_params.get("maxiterate", 0))])
+        return args
+
     def _build_command(
         self,
         input_file: str,
         threads: int | None = None,
         sequence_count: int | None = None,
         max_len: int | None = None,
+        min_len: int | None = None,
+        alphabet: str | None = None,
     ) -> list[str]:
-        """Build MAFFT command line arguments with adaptive heuristics for massive datasets."""
-        cmd = [self.exec_path]
+        """Build one complete MAFFT command line.
 
-        # Check whether adaptive heuristics are enabled (default: True)
-        adaptive_enabled = self.tool_params.get(
-            "adaptive_heuristics",
-            self.user_params.get("adaptive_heuristics", True),
-        )
-        parttree_threshold = int(
-            self.tool_params.get("parttree_threshold", self.PARTTREE_THRESHOLD_DEFAULT)
-        )
-        retree1_threshold = int(
-            self.tool_params.get("retree1_threshold", self.RETREE1_THRESHOLD_DEFAULT)
-        )
+        The algorithm comes from the work-based strategy (see class docstring);
+        an explicit ``algorithm`` in the tool configuration or
+        ``adaptive_heuristics=False`` bypasses it. ``sequence_count``,
+        ``max_len`` and ``min_len`` (shortest sequence) may be supplied by the
+        caller (for example from the feature store's region summary) to avoid
+        scanning ``input_file``; ``alphabet`` (``"nucl"``/``"prot"``) defaults
+        to the ``prot_`` filename-prefix detection.
 
-        explicit_algorithm = self.tool_params.get("algorithm")
-
-        # If algorithm was explicitly requested (e.g. localpair, globalpair, retree), honor it directly
-        if explicit_algorithm and explicit_algorithm != "auto":
-            if explicit_algorithm == "localpair":
-                cmd.append("--localpair")
-            elif explicit_algorithm == "globalpair":
-                cmd.append("--globalpair")
-            elif explicit_algorithm == "genafpair":
-                cmd.append("--genafpair")
-            elif explicit_algorithm == "retree":
-                retree_num = self.tool_params.get("retree", 1)
-                cmd.extend(["--retree", str(retree_num)])
-            elif explicit_algorithm == "maxiterate":
-                maxiterate_num = self.tool_params.get("maxiterate", 0)
-                cmd.extend(["--maxiterate", str(maxiterate_num)])
+        A single command cannot express the short-sequence path (PartTree tier
+        plus ``--addfragments``); for such inputs this method returns the
+        legacy ``--auto`` bypass command. :meth:`align` never uses it: it runs
+        :meth:`_align_with_fragments` instead.
+        """
+        alpha = self._detect_alphabet(input_file, alphabet)
+        explicit = self._explicit_algorithm()
+        if explicit:
+            # If an algorithm was explicitly requested, honor it directly
+            algorithm_args = self._explicit_algorithm_args(explicit)
+        elif not self._adaptive_enabled():
+            algorithm_args = ["--auto"]
         else:
-            # Resolve sequence count and sequence lengths
-            if sequence_count is not None and max_len is not None:
-                n_seq = sequence_count
-                min_len = 6
-                max_l = max_len
-            elif os.path.exists(input_file):
-                scanned_count, min_len, scanned_max = self._scan_fasta_meta(input_file)
-                n_seq = sequence_count if sequence_count is not None else scanned_count
-                max_l = max_len if max_len is not None else scanned_max
+            resolved = self._resolve_strategy(
+                input_file, sequence_count, max_len, min_len, alpha
+            )
+            strategy = resolved.strategy
+            if strategy.needs_fragment_split:
+                log.warning(
+                    f"      adaptive heuristic: tier {strategy.tier.name} (N="
+                    f"{resolved.n_seq}, max_len={resolved.max_len}, "
+                    f"W={strategy.work:.2e}) needs the short-sequence path (min "
+                    f"length={resolved.min_len} < 6); a single command can only "
+                    "use --auto (align() uses --addfragments instead)."
+                )
+                algorithm_args = ["--auto"]
             else:
-                n_seq = sequence_count if sequence_count is not None else 0
-                min_len = 6
-                max_l = max_len if max_len is not None else 0
-
-            # Compute FLOP complexity: W = N * (L_max ^ alpha)
-            if max_l < 1000:
-                alpha = 2.0
-            elif max_l < 2500:
-                alpha = 2.2
-            else:
-                alpha = 2.4
-            work_score = float(n_seq) * (float(max_l) ** alpha) if max_l > 0 else 0.0
-
-            WORK_RETREE1_THRESHOLD = float(self.tool_params.get("work_retree1_threshold", 2.0e10))
-            WORK_PARTTREE_THRESHOLD = float(self.tool_params.get("work_parttree_threshold", 2.5e9))
-
-            qualifies_retree1 = (n_seq >= retree1_threshold) or (work_score >= WORK_RETREE1_THRESHOLD)
-            qualifies_parttree = (n_seq >= parttree_threshold) or (work_score >= WORK_PARTTREE_THRESHOLD)
-
-            # PartTree requires 6-mer indexing; any sequence < 6 chars aborts MAFFT
-            if adaptive_enabled and qualifies_parttree:
-                if min_len < 6:
-                    log.warning(
-                        f"      adaptive heuristic: dataset (N={n_seq}, max_len={max_l}, W={work_score:.2e}) "
-                        f"qualifies for PartTree, but contains short sequence(s) (min length={min_len} < 6). "
-                        f"Bypassing PartTree to prevent aligner abort; falling back to --auto."
-                    )
-                    cmd.append("--auto")
-                elif qualifies_retree1:
-                    cmd.append("--parttree")
-                    cmd.extend(["--retree", "1", "--maxiterate", "0", "--nofft"])
+                algorithm_args = list(strategy.mafft_args)
+                if strategy.tier is not AlignmentTier.ACCURATE:
                     log.info(
-                        f"      adaptive heuristic (N={n_seq}, max_len={max_l}, W={work_score:.2e}):"
-                        " applied MAFFT NW-NS-PartTree1 (--parttree --retree 1 --maxiterate 0 --nofft)"
+                        f"      adaptive heuristic (N={resolved.n_seq}, "
+                        f"max_len={resolved.max_len}, W={strategy.work:.2e}): tier "
+                        f"{strategy.tier.name} ({' '.join(algorithm_args)})"
                     )
-                else:
-                    cmd.append("--parttree")
-                    cmd.extend(["--retree", "2", "--maxiterate", "0", "--nofft"])
-                    log.info(
-                        f"      adaptive heuristic (N={n_seq}, max_len={max_l}, W={work_score:.2e}):"
-                        " applied MAFFT NW-NS-PartTree2 (--parttree --retree 2 --maxiterate 0 --nofft)"
+        return self._assemble_command(algorithm_args, input_file, threads, alpha)
+
+    # ------------------------------------------------------------------
+    # running
+    # ------------------------------------------------------------------
+
+    def _run_to_file(self, cmd: list[str], output_file: str) -> bool:
+        """Run ``cmd`` with stdout redirected to ``output_file``."""
+        with open(output_file, "w") as out_handle:
+            process = subprocess.run(
+                cmd,
+                stdout=out_handle,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                check=False,
+                env=self._get_subprocess_env(),
+            )
+        if process.returncode == 0:
+            return True
+        log.error(f"   MAFFT failed with return code {process.returncode}")
+        return False
+
+    def _align_with_fragments(
+        self,
+        input_file: str,
+        output_file: str,
+        threads: int | None,
+        strategy: AlignmentStrategy,
+        alphabet: str,
+    ) -> bool:
+        """Align a locus that has sequences too short for PartTree.
+
+        1. Split the input into *main* (>= 6 residues), *short* (1-5 residues)
+           and *empty* (0 residues) sequences.
+        2. Align the main sequences with the chosen PartTree tier.
+        3. Add the short ones with ``mafft --addfragments short.fa main.aln``
+           (or ``--add`` when the main set exceeds ``addfragments_max_n``
+           sequences, because ``--addfragments`` needs about 25 B * N^2 of
+           memory versus 4.4 B * N^2 for ``--add``). No ``--keeplength``: it
+           would delete residues of the short sequences.
+        4. Empty sequences (which MAFFT cannot read) become all-gap rows.
+        5. Write the rows in the ORIGINAL input order with the original
+           headers (so the output is deterministic and every ungapped row is
+           the input sequence).
+
+        Temporary files live in this aligner's scratch directory. With fewer
+        than 2 main sequences PartTree cannot run (it crashes on 1): the whole
+        set is then aligned with ``--auto`` if N is below the fixed N cap and
+        a ``ValueError`` is raised otherwise.
+        """
+        records = _read_fasta_records(input_file)
+        n_total = len(records)
+        min_ok = DEFAULT_CONSTANTS.min_parttree_seq_len
+        main: list[int] = []
+        short: list[int] = []
+        empty: list[int] = []
+        for i, (_, seq) in enumerate(records):
+            n_res = len(seq.translate(_NON_RESIDUES))
+            (empty if n_res == 0 else short if n_res < min_ok else main).append(i)
+
+        if len(main) < 2:
+            cap = int(
+                self._strategy_overrides().get(
+                    "n_force_parttree", DEFAULT_CONSTANTS.n_force_parttree
+                )
+            )
+            if n_total >= cap:
+                raise ValueError(
+                    f"cannot align {os.path.basename(input_file)}: PartTree needs at "
+                    f"least 2 sequences of >= {min_ok} residues but only "
+                    f"{len(main)} of {n_total} qualify, and --auto is refused for "
+                    f"N >= {cap} (O(N^2) memory)"
+                )
+            log.warning(
+                f"      fewer than 2 sequences of >= {min_ok} residues in "
+                f"{os.path.basename(input_file)}; using --auto for this small locus"
+            )
+            cmd = self._assemble_command(["--auto"], input_file, threads, alphabet)
+            return self._run_to_file(cmd, output_file)
+
+        scratch = tempfile.mkdtemp(prefix="pba_frag_", dir=str(self.scratch_mgr.path))
+        try:
+            main_fa = os.path.join(scratch, "main.fa")
+            short_fa = os.path.join(scratch, "short.fa")
+            main_aln = os.path.join(scratch, "main.aln")
+            combined_aln = os.path.join(scratch, "combined.aln")
+            _write_fasta_records(main_fa, ((f"m{i}", records[i][1]) for i in main))
+            _write_fasta_records(short_fa, ((f"m{i}", records[i][1]) for i in short))
+
+            cmd = self._assemble_command(
+                strategy.mafft_args, main_fa, threads, alphabet
+            )
+            log.info(
+                f"      short-sequence path: aligning {len(main)} sequences with "
+                f"{strategy.tier.name}, then adding {len(short)} short sequence(s)"
+            )
+            if not self._run_to_file(cmd, main_aln):
+                return False
+            aligned_path = main_aln
+            if short:
+                cap_add = int(
+                    self.tool_params.get(
+                        "addfragments_max_n", DEFAULT_CONSTANTS.addfragments_max_n
                     )
-            else:
-                cmd.append("--auto")
+                )
+                add_flag = "--addfragments" if len(main) <= cap_add else "--add"
+                mafft_threads = (
+                    threads
+                    if threads is not None
+                    else self.tool_params.get("threads", 1)
+                )
+                add_cmd = [self.exec_path or "mafft", add_flag, short_fa]
+                add_cmd.extend(["--thread", str(mafft_threads)])
+                if self.tool_params.get("quiet"):
+                    add_cmd.append("--quiet")
+                add_cmd.append(main_aln)
+                if not self._run_to_file(add_cmd, combined_aln):
+                    return False
+                aligned_path = combined_aln
 
-        # Prioritize dynamically leased threads, falling back to tool_params
-        mafft_threads = (
-            threads if threads is not None else self.tool_params.get("threads", 1)
-        )
-        cmd.extend(["--thread", str(mafft_threads)])
-
-        # Add other MAFFT options
-        # adjustdirection is strictly nucleotide-only and should only be applied if explicitly enabled
-        # or when not aligning amino acid sequences
-        is_protein = os.path.basename(input_file).startswith("prot_")
-        if not is_protein and self.tool_params.get("adjustdirection", False):
-            cmd.append("--adjustdirection")
-
-        if self.tool_params.get("quiet"):
-            cmd.append("--quiet")
-
-        # Add input file
-        cmd.append(input_file)
-        return cmd
+            combined = _read_aligned_fasta(aligned_path)
+            widths = {len(row) for row in combined.values()}
+            if len(widths) > 1:
+                raise ValueError("MAFFT returned rows of unequal length")
+            width = widths.pop() if widths else 0
+            mismatched = 0
+            empty_set = set(empty)
+            with open(output_file, "w") as out_handle:
+                for i, (header, seq) in enumerate(records):
+                    reverse_complemented = False
+                    if i in empty_set:
+                        row = "-" * width
+                    elif f"m{i}" in combined:
+                        row = combined[f"m{i}"]
+                    elif f"_R_m{i}" in combined:  # reverse-complemented by MAFFT
+                        row = combined[f"_R_m{i}"]
+                        reverse_complemented = True
+                    else:
+                        raise ValueError(f"MAFFT output lacks the record {header!r}")
+                    if (
+                        not reverse_complemented
+                        and row.replace("-", "").upper() != "".join(seq.split()).upper()
+                    ):
+                        mismatched += 1
+                    _write_wrapped(
+                        out_handle,
+                        f"_R_{header}" if reverse_complemented else header,
+                        row,
+                    )
+            if mismatched:
+                log.warning(
+                    f"      {mismatched} row(s) of {os.path.basename(output_file)} "
+                    "differ from their input sequence after the short-sequence path"
+                )
+            return True
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
 
     def align(
         self,
@@ -307,35 +600,56 @@ class MAFFT(AlignmentTool):
         threads: int | None = None,
         sequence_count: int | None = None,
         max_len: int | None = None,
+        min_len: int | None = None,
+        alphabet: str | None = None,
         **kwargs: Any,
     ) -> bool:
-        """Perform alignment using MAFFT with dynamic threads and adaptive heuristics."""
+        """Perform alignment using MAFFT with dynamic threads and adaptive heuristics.
+
+        `sequence_count`, `max_len` and `min_len` are optional hints (typically from
+        the feature store) that spare the strategy resolution a scan of the input
+        file. `alphabet` (``"nucl"``/``"prot"``) overrides the ``prot_`` filename
+        detection.
+        """
         if not self._validate_input(input_file, output_file):
             return False
 
         try:
-            cmd = self._build_command(
-                input_file, threads=threads, sequence_count=sequence_count
-            )
-
-            with open(output_file, "w") as out_handle:
-                process = subprocess.run(
-                    cmd,
-                    stdout=out_handle,
-                    stderr=subprocess.DEVNULL,
-                    text=True,
-                    check=False,
-                    env=self._get_subprocess_env(),
+            alpha = self._detect_alphabet(input_file, alphabet)
+            if self._explicit_algorithm() is None and self._adaptive_enabled():
+                resolved = self._resolve_strategy(
+                    input_file, sequence_count, max_len, min_len, alpha
                 )
-            if process.returncode == 0:
+                if resolved.strategy.needs_fragment_split:
+                    log.info(
+                        f"      adaptive heuristic (N={resolved.n_seq}, max_len="
+                        f"{resolved.max_len}, W={resolved.strategy.work:.2e}): "
+                        f"{resolved.strategy.reason}"
+                    )
+                    return self._align_with_fragments(
+                        input_file, output_file, threads, resolved.strategy, alpha
+                    )
+                # forward the resolved statistics so the command build never rescans
+                sequence_count, max_len, min_len = (
+                    resolved.n_seq,
+                    resolved.max_len,
+                    resolved.min_len,
+                )
+            cmd = self._build_command(
+                input_file,
+                threads=threads,
+                sequence_count=sequence_count,
+                max_len=max_len,
+                min_len=min_len,
+                alphabet=alpha,
+            )
+            if self._run_to_file(cmd, output_file):
                 log.info(
                     f"      successfully aligned {os.path.basename(input_file)} using"
                     f" MAFFT ({' '.join(cmd[1:])})"
                 )
                 return True
-            else:
-                log.error(f"   MAFFT failed with return code {process.returncode}")
-                return False
+            return False
         except Exception as e:
             log.error(f"   error during MAFFT alignment: {e}")
             return False
@@ -364,7 +678,7 @@ class ClustalOmega(AlignmentTool):
             return False
 
         try:
-            cmd = [self.exec_path]
+            cmd: list[str] = [self.exec_path or "clustalo"]
 
             # Add input/output files
             cmd.extend(["--infile", input_file])
@@ -433,7 +747,7 @@ class MUSCLE(AlignmentTool):
             return False
 
         try:
-            cmd = [self.exec_path]
+            cmd: list[str] = [self.exec_path or "muscle"]
 
             # Add input and output files
             cmd.extend(["-super5", input_file])
@@ -528,7 +842,9 @@ class GenericAlignmentTool(AlignmentTool):
         threads: int | None = None,
     ) -> list[str]:
         """Build the command line for a generic tool based on configuration."""
-        cmd = [self.exec_path]
+        cmd: list[str] = [
+            self.exec_path or str(self.user_params.get("alignment_tool", ""))
+        ]
         input_flag = self.tool_params.get("input_flag")
         output_flag = self.tool_params.get("output_flag")
         if input_flag:
