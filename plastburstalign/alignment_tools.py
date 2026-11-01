@@ -523,7 +523,9 @@ class MAFFT(AlignmentTool):
             return True
         err_msg = (process.stderr or "").strip()
         cmd_str = " ".join(cmd)
-        log.error(f"    MAFFT failed [cmd: {cmd_str}] (rc={process.returncode}):\n{err_msg}")
+        log.error(
+            f"    MAFFT failed [cmd: {cmd_str}] (rc={process.returncode}):\n{err_msg}"
+        )
         return False
 
     def _prepare_cmd(
@@ -653,14 +655,18 @@ class MAFFT(AlignmentTool):
                 add_cmd.append(main_aln)
                 add_cmd = self._prepare_cmd(add_cmd, cpu_ids=cpu_ids, pin=pin)
                 if not self._run_to_file(add_cmd, combined_aln, env=env):
-                    if add_flag == '--addfragments':
-                        log.warning('    --addfragments failed/segfaulted on short fragments; falling back to --add')
-                        fallback_cmd = [self.exec_path or 'mafft', '--add', short_fa]
-                        fallback_cmd.extend(['--thread', str(mafft_threads)])
-                        if self.tool_params.get('quiet'):
-                            fallback_cmd.append('--quiet')
+                    if add_flag == "--addfragments":
+                        log.warning(
+                            "    --addfragments failed/segfaulted on short fragments; falling back to --add"
+                        )
+                        fallback_cmd = [self.exec_path or "mafft", "--add", short_fa]
+                        fallback_cmd.extend(["--thread", str(mafft_threads)])
+                        if self.tool_params.get("quiet"):
+                            fallback_cmd.append("--quiet")
                         fallback_cmd.append(main_aln)
-                        fallback_cmd = self._prepare_cmd(fallback_cmd, cpu_ids=cpu_ids, pin=pin)
+                        fallback_cmd = self._prepare_cmd(
+                            fallback_cmd, cpu_ids=cpu_ids, pin=pin
+                        )
                         if not self._run_to_file(fallback_cmd, combined_aln, env=env):
                             return False
                     else:

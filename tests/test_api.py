@@ -181,6 +181,7 @@ class CliFlagTests(unittest.TestCase):
 
     def test_version(self) -> None:
         from contextlib import redirect_stderr
+
         buf = io.StringIO()
         with redirect_stdout(buf), redirect_stderr(buf):
             code = main(["--version"])
@@ -195,6 +196,7 @@ class CliFlagTests(unittest.TestCase):
         out = self.root / "est_out"
         out.mkdir(exist_ok=True)
         from contextlib import redirect_stderr
+
         buf = io.StringIO()
         with redirect_stdout(buf), redirect_stderr(buf):
             code = main(
