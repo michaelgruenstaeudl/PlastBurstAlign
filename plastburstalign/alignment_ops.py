@@ -545,7 +545,7 @@ class AlignmentCoordination:
                 if plan_chunks is not None:
                     pinned = pin_algorithm_args(strategy, n_seq, max_len)
                     chunk_dir = os.path.join(
-                        scratch_dir or self._get_worker_scratch(),
+                        self._get_worker_scratch(),
                         f"{region}_chunks",
                     )
                     os.makedirs(chunk_dir, exist_ok=True)
@@ -649,6 +649,7 @@ class AlignmentCoordination:
                             return True
                         finally:
                             _cleanup_unalign()
+                            shutil.rmtree(chunk_dir, ignore_errors=True)
 
                     return FanOut(
                         [make_chunk(i) for i in range(plan_chunks.n_chunks)],
@@ -827,7 +828,7 @@ class AlignmentCoordination:
                 if plan_chunks is not None:
                     pinned = pin_algorithm_args(strategy, n_seq, max_len)
                     chunk_dir = os.path.join(
-                        scratch_dir or self._get_worker_scratch(),
+                        self._get_worker_scratch(),
                         f"{region}_prot_chunks",
                     )
                     os.makedirs(chunk_dir, exist_ok=True)
