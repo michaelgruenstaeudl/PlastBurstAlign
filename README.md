@@ -1,220 +1,203 @@
 # PlastBurstAlign
-A Python tool to extract and align genes, introns, and intergenic spacers across thousands of plastid genomes using associative arrays
+
+[![CI](https://github.com/michaelgruenstaeudl/PlastBurstAlign/actions/workflows/ci.yml/badge.svg)](https://github.com/michaelgruenstaeudl/PlastBurstAlign/actions/workflows/ci.yml)
+[![Code style: ruff](https://img.shields.io/badge/code%20style-ruff-000000.svg)](https://www.astral.sh/ruff)
+[![Type Checked: mypy](https://img.shields.io/badge/type%20checked-mypy-blue.svg)](https://mypy-lang.org/)
+[![License: BSD-3-Clause](https://img.shields.io/badge/License-BSD_3--Clause-blue.svg)](https://opensource.org/licenses/BSD-3-Clause)
+
+Extract and align genes, introns, and intergenic spacers across hundreds or thousands of plastid genomes—with bounded memory, deterministic strategy selection, and optional Slurm parallelism.
+
+**Version:** `3.0.0rc1` (release candidate).
+
+---
+
+### Quick start
+
+```python
+import plastburstalign as pba
+
+result = pba.align("Input_GBK", mode="cds", out_dir="Out_CDS", seed=1)
+print(result.summary())
+```
+
+CLI (after `conda env create -f environment.yml && conda activate plastburstalign` and `pip install -e .`):
+
+```bash
+plastburstalign -i Input_GBK -o Out_CDS -s cds -a mafft -c --seed 1
+```
+
+Same entry point via `pba` or `python -m plastburstalign`. Put GenBank flatfiles in `Input_GBK` (default extension `.gb`).
 
 ---
 
 ### Purpose
-This software tool is designed for large-scale quality assessment of organellar genome annotations. It detects annotation discrepancies in large genome datasets by comparing sequence and annotation features through automated multiple sequence alignments across homologous regions.
 
-### Background
-The multiple sequence alignment (MSA) of a set of plastid genomes is challenging. At least five factors contribute to this challenge:
-- First, the plastid genome is a mosaic of individual genome regions. An MSA procedure must identify, extract, group, and align homologous regions across the input genomes.
-- Second, many plastid genomes contain annotation errors in gene positions and/or gene names. An MSA procedure must automatically exclude incorrectly annotated regions from the alignment procedure.
-- Third, plastid genomes comprise both coding and noncoding regions, which require different alignment strategies (e.g., amino acid-based for genes, nucleotide-based for introns and intergenic spacers). An MSA procedure must apply the appropriate strategy automatically.
-- Fourth, modern plastid genome studies often involve hundreds, if not thousands, of complete genomes. An MSA procedure must perform sequence alignment within practical time frames (e.g., hours rather than days).
-- Fifth, manually excluding user-specified genome regions after alignment is prohibitively complex. An MSA procedure must support the automatic exclusion of user-specified regions before the alignment starts.
+PlastBurstAlign builds multigenic MSAs from annotated plastomes: it extracts homologous regions, applies an appropriate nucleotide or protein alignment strategy, streams a dense supermatrix, and writes FASTA / NEXUS / partition files suitable for phylogenomics. It is also useful for large-scale annotation QC (missing or misplaced features show up as gaps or failed loci).
 
-The software `plastburstalign` addresses these and other challenges: it provides an MSA procedure that extracts and aligns genes, introns, and intergenic spacers across hundreds or thousands of plastid genomes in an autonomous fashion.
+![Depiction of plastomes being split by marker type; sequences are aligned and concatenated](docs/PlastBurstAlign_ProcessOverview.png)
 
-### Overview of process
-![Depiction of plastomes being split according to specified marker type; the extracted sequences are then aligned and concatenated](docs/PlastBurstAlign_ProcessOverview.png)
+---
 
-### Main features
-- Extraction of all genome regions from set of input plastid genomes, followed by grouping and alignment of the extracted regions:
-  - genes (cds)
-  - introns (int)
-  - intergenic spacers (igs)
-  - tRNAs and rRNAs (rna; nucleotide-only alignment)
-- Support for multiple alignment tools:
-  - MAFFT
-  - MUSCLE
-  - Clustal Omega
-- Automatic exon splicing:
-  - automatic merging of all exons of any cis-spliced gene
-  - automatic grouping of all exons of any trans-spliced gene (e.g., _rps12_), followed by merging of adjacent exons [see `ExonSpliceHandler` for both]
-- Automatic quality control to evaluate if extracted genes are complete (i.e., valid start and stop codon present)
-- Duplicate regions are stored by normalized region name, with at most one copy of each named region retained per genome; for intergenic spacers, the software also checks the reverse-flanking-gene name so that IR-mirrored spacers are not counted twice.
-- Removal of user-specified regions:
-  - regions that do not fulfill a minimum, user-specified sequence length
-  - regions that do not fulfill a minimum, user-specified number of taxa of the dataset that the region must be found in [see `DataCleaning` for both]
-  - any user-specified genome region (i.e., gene, intron, or intergenic spacer)
--  Automatic determination if DNA sequence alignment based on amino acid (for CDS) or nucleotide (for introns, intergenic spacers, tRNAs, and rRNAs) sequence information
-- Parallelized processing for faster extraction and alignment across multiple CPUs
+### What is new in v3
 
-### Additional features
-- Concatenation of all genome regions alignment either in alphabetic order or based on location in genome (first input genome used as reference)
-- Automatic standardization of tRNA gene names to accommodate letter case differences among the gene annotations of different input genomes (e.g., for anticodon and amino acid abbreviations of tRNAs)
-- Automatic standardization of plastid rRNA names to `rrn16`, `rrn23`, `rrn4.5`, or `rrn5`
-- Flexible configuration of alignment tools via user-defined parameters
-- Production of informative logs; two detail levels:
-  - default (suitable for regular software execution)
-  - verbose (suitable for debugging)
-- Clear reporting when genome regions cannot be extracted
+| Area | Behavior |
+|------|----------|
+| Strategy | Work model `N·L^α + β·N²·L`; tier choice is a pure function of the data (not core count). Provisional constants until calibration finishes—see [docs/calibration.md](docs/calibration.md). |
+| Scheduler | CPU-set leases, memory admission, straggler promotion; optional anchor-based sub-locus chunking (`--subdivide`). |
+| Data engine | Dense `uint8` matrices, vectorized site filters, streaming `SupermatrixBuilder`, codon-aware partitions. |
+| Host / tools | `HostProfile` + `autotune` (workers, scratch tier, memory envelope); aligner resolver with built-in center-star fallback; `plastburstalign --doctor`. |
+| Determinism | Same inputs + `--seed` → identical FASTA/NEXUS/partitions across repeats, thread counts (`--subdivide off`), and `PYTHONHASHSEED`. |
+| Ops | Run manifest (`run_manifest.json`), PlastBench harness, golden parity gate, CI on Python 3.11–3.13. |
 
-### Input/output
-#### Input
-- Set of complete plastid genomes (each in GenBank flatfile format)
-#### Output
-- DNA sequence alignments of individual genome regions (FASTA format)
-- Concatenation of all individual DNA sequence alignments (FASTA and NEXUS format)
+Hardware affects scheduling and scratch only. Opt-in `--time-budget` (when wired) is the only host-adaptive mode and is non-reproducible by design.
 
-### Installation on Linux (Debian)
-```bash
-# Installation
-#pip install git+https://github.com/michaelgruenstaeudl/PlastBurstAlign.git  
-#pip3 install git+ssh://git@github.com/michaelgruenstaeudl/PlastBurstAlign.git
+---
 
-pip install plastburstalign
-```
-You must manually install one of the supported alignment tools (MAFFT, MUSCLE, Clustal Omega). If the executable is NOT installed in PATH, provide tool path in input.
+### Installation
 
-### Installation of External alignment tools
-### Option 1 — Conda environment (recommended)
+**Conda (recommended)** — installs Python deps and aligner binaries:
+
 ```bash
 git clone https://github.com/michaelgruenstaeudl/PlastBurstAlign.git
 cd PlastBurstAlign
 conda env create -f environment.yml
 conda activate plastburstalign
+pip install -e .
 ```
-This environment installs Python dependencies and external alignment tools (MAFFT, MUSCLE, Clustal Omega).
-### Option 2 — Manual installation
-```bash
-sudo apt install mafft muscle clustalo
-```
-### Usage
 
-### Command-line (recommended)
-After installation via `pip`, run:
+**Pip** (aligners must already be on `PATH`, or use the built-in fallback):
 
 ```bash
-plastburstalign
-```
-### Example run
-
-```bash
-plastburstalign \
-  -i Input_dataset \
-  -o Output_dataset \
-  -s cds \
-  -a mafft
+pip install plastburstalign
+# optional system packages: mafft, muscle, clustalo
 ```
 
-### Detailed examples
-See [this document](https://github.com/michaelgruenstaeudl/PlastBurstAlign/blob/main/docs/exemplary_usage.md)
-
-### Benchmarking
-```bash
-cd benchmarking
-# CDS
-python benchmarking_CDS.py benchmark_YangEtAl2022_Asteraceae 5
-# INT
-python benchmarking_INT.py benchmark_YangEtAl2022_Asteraceae 5
-# IGS
-python benchmarking_IGS.py benchmark_YangEtAl2022_Asteraceae 5
-```
-- Dataset `benchmark_ZhangNNEtAl2025_53angiosperms`: the same dataset (angiosperms; n=53) as used in [Zhang N.-N. et al. 2025](https://doi.org/10.1016/j.pld.2025.05.005)
-- Dataset `benchmark_YangEtAl2022_Asteraceae.tar.gz`: all Asteraceae (n=155) listed in [Yang et al. 2022](https://www.frontiersin.org/journals/plant-science/articles/10.3389/fpls.2022.808156)
-- Dataset `benchmark_YangEtAl2022_monocots`: all monocots (n=733) listed in [Yang et al. 2022](https://www.frontiersin.org/journals/plant-science/articles/10.3389/fpls.2022.808156)
-- Dataset `benchmark_YangEtAl2022_angiosperms`: all angiosperms (n=2585) listed in [Yang et al. 2022](https://www.frontiersin.org/journals/plant-science/articles/10.3389/fpls.2022.808156)
-- Dataset `benchmark_ZhangNNEtAl2025_13724angiosperms`: the same dataset (angiosperms; n=13724 instead of n=13731) as used in [Zhang N.-N. et al. 2025](https://doi.org/10.1016/j.pld.2025.05.005) but not including records AC_000188, NC_029253, NC_029254, NC_029331, NC_029333, NC_071962, and NC_085618, which have been removed by NCBI from NCBI RefSeq as a result of standard genome annotation processing.
+Requires Python ≥ 3.11. Dev extras: `pip install -e ".[dev]"`.
 
 ---
 
-### Parameters overview
+### CLI usage
 
-| Option | Description | Example |
-|--------|-------------|---------|
-| `-i` | Input dataset directory | `-i Input_dataset` |
-| `-o` | Output directory | `-o Output_dataset` |
-| `-s` | Sequence type to extract (`cds`, `int`, `igs`, or `rna`) | `-s cds` |
-| `-a` | Alignment tool to use | `-a mafft` |
-| `-l` | Minimum sequence length (bp); regions shorter than this are excluded| `-l 9` |
-| `-t` | Minimum number of taxa (int) or relative frequency (0<value<=1) in which a region must be present to be extracted | `-t 0.1` |
-| `-n` | Number of threads to use| `-n 8` |
-| `--no-trna` | Disable tRNAs in `rna` mode (default: enabled) | `--no-trna` |
-| `--no-rrna` | Disable rRNAs in `rna` mode (default: enabled) | `--no-rrna` |
-| `--config` | Path to YAML config file containing parameters | `--config config.yaml` |
+```bash
+# CDS with concatenation, fixed seed, site occupancy trim, RAxML+NEXUS partitions
+plastburstalign -i Input_GBK -o Out_CDS -s cds -a mafft -c \
+  --seed 1 --trim occupancy=0.5 --partitions raxml,nexus -n auto
+
+# Disable sub-locus chunking (strict thread-invariant alignments)
+plastburstalign -i Input_GBK -o Out_IGS -s igs -a mafft -c --subdivide off --seed 1
+
+# Diagnose host, resolved aligners, and scratch recommendations
+plastburstalign --doctor
+```
+
+| Flag | Role |
+|------|------|
+| `-s` / `--selectmode` | `cds`, `int`, `igs`, or `rna` |
+| `-n` / `--numthreads` | Positive int or `auto` (usable physical cores) |
+| `--trim` | `none`, `occupancy=<f>`, `entropy`, `informative-only`, `gappyout` |
+| `--min-occupancy` | Adds / sets occupancy threshold |
+| `--partitions` | `raxml`, `nexus`, `iqtree`, `partitionfinder`, or `none` |
+| `--codon-partitions` | CDS codon-position partitions |
+| `--subdivide` | `auto` (default), `off`, or `force` |
+| `--keep-unaligned` / `--no-keep-unaligned` | Retain unaligned FASTA in `out_dir` |
+| `--smt` / `--no-smt` | Include / exclude SMT siblings in the CPU budget |
+| `--memory-limit` | Admission cap (e.g. `8G`) |
+| `--seed` | MAFFT `--randomseed` for deterministic runs |
+| `--phylip` | Also write relaxed PHYLIP concatenation |
+| `--doctor` | Print host / aligner / scratch report and exit |
+| `--estimate` | Pre-flight cost estimate after extract/clean; exit without aligning |
+| `--dashboard` / `--no-dashboard` | Force rich live dashboard on/off (default: auto) |
+| `--time-budget` | Opt-in stub; value recorded only (host-adaptive path not fully wired) |
+| `--export-slurm` / `--align-partition` / `--finalize-slurm` | Slurm array workflow |
+
+See `plastburstalign --help` and [docs/exemplary_usage.md](docs/exemplary_usage.md).
+
+Modes: `cds` (protein-guided), `int`, `igs`, `rna` (tRNA+rRNA; use `--no-trna` / `--no-rrna` to restrict).
 
 ---
 
-### Extracting tRNAs and rRNAs
+### Autotune, trimming, partitions
 
-Use `-s rna` (or `select_mode: "rna"` in a YAML configuration) to extract annotated
-`tRNA` and `rRNA` features and align them directly as DNA nucleotide sequences:
+With `-n auto`, PlastBurstAlign profiles the host (cores, cgroup/Slurm limits, RAM, tmpfs) and builds a `TuningPlan`: worker count, per-task thread cap, scratch tier, and a memory envelope. The plan is logged at run start and recorded in `run_manifest.json`.
 
-```bash
-plastburstalign -i Input_dataset -o Output_RNA -s rna -a mafft
-```
+Trimming runs in-flight on dense locus matrices before concatenation. Partition writers emit RAxML-NG / IQ-TREE style blocks and NEXUS `charset` / `charpartition`; optional codon partitions track original column indices through trimming.
 
-Both RNA types are enabled by default. Select only one type with:
+---
 
-```bash
-# tRNAs only
-plastburstalign -i Input_dataset -o Output_tRNA -s rna --no-rrna -a mafft
-# rRNAs only
-plastburstalign -i Input_dataset -o Output_rRNA -s rna --no-trna -a mafft
-```
+### Slurm
 
-The equivalent YAML and Python API parameters are `include_trna` and `include_rrna`
-(booleans, both defaulting to `true`). Explicit CLI switches override YAML values;
-omitted switches leave YAML values unchanged. Disabling both types in `rna` mode
-is an error. These switches do not affect `cds`, `int`, or `igs` mode.
+1. `plastburstalign -i … -o … -s … --export-slurm --slurm-partitions N …` writes array scripts and a `slurm_manifest.json`. Partition weights use the region work estimate (`N·L^α`), not file sizes.
+2. Workers run `--align-partition K --manifest …` and export unaligned FASTA from the SQLite feature store into node-local scratch (no shared unaligned tree required).
+3. `--finalize-slurm --manifest …` verifies partition outputs and builds the supermatrix.
 
-RNA mode does not translate sequences, require start/stop codons, or trim sequences
-to a multiple of three. It extracts all annotated parts in strand-correct order;
-for joined features, the exons are concatenated and intervening introns are omitted.
-Features must have a `gene` qualifier, as in the other modes. Gene-name normalization
-(including tRNA names), removal of duplicate copies per genome, minimum sequence
-length and taxon thresholds, ordering, and optional concatenation all apply.
-Both `--exclcds` (gene exclusions) and `--exclreg` (region exclusions) can exclude RNA
-genes by their normalized names. Output uses the existing `nucl_` FASTA and NEXUS
-formats, with no protein files. The `cds`, `int`, and `igs` modes are unchanged.
-
-### Source usage
-If you cloned the repository:
-
-```bash
-git clone https://github.com/michaelgruenstaeudl/PlastBurstAlign.git
-cd PlastBurstAlign
-python -m plastburstalign
-```
+Use `--scratch-dir` / `$SLURM_TMPDIR` for fast node-local I/O.
 
 ---
 
 ### Python API
 
-You can also use the package directly in Python:
+Preferred entry point:
 
 ```python
-from plastburstalign import PlastBurstAlign
+import plastburstalign as pba
 
-burst = PlastBurstAlign()
-burst.execute()
+result = pba.align(
+    "Input_GBK", mode="cds", out_dir="Out_CDS", seed=1, trim="occupancy=0.5"
+)
+print(result.summary())  # AlignmentResult: matrix, writers, run_manifest path
+plan = pba.autotune(num_threads="auto")
+est = pba.estimate("Input_GBK", mode="cds")
 ```
 
-
-#### Usage of individual package components
-Individual components can be used as well. For example, to use the class `MAFFT` by itself (e.g., instantiate a configuration of MAFFT that will execute with 1 thread; institute another that will execute with 10 threads), type:
+Lower-level `UserParameters` + `PlastBurstAlign` remains available for Slurm / custom sinks:
 
 ```python
-from plastburstalign import MAFFT, MUSCLE, ClustalOmega
+from plastburstalign import PlastBurstAlign, UserParameters
 
-mafft = MAFFT({"num_threads": 4})
-muscle = MUSCLE()
-clustal = ClustalOmega()
+params = UserParameters(
+    in_dir="Input_GBK",
+    out_dir="Out_CDS",
+    select_mode="cds",
+    alignment_tool="mafft",
+    concat=True,
+    seed=1,
+    subdivide="off",
+    trim="occupancy=0.5",
+    num_threads="auto",
+)
+PlastBurstAlign(params).execute()
 ```
 
-### Details on exon splicing
-The plastid genome is a mosaic of individual genome regions, with many of its genes consisting of multiple exons. To align genes based on their amino acid sequence information, all exons of a gene must be extracted and concatenated prior to alignment. `plastburstalign` conducts this exon splicing through an automated process that differentiates between cis- or trans-spliced genes: the exons of cis-spliced genes are adjacent to each other, those of trans-spliced genes are not. The software concatenates the exons of any cis-spliced gene in place (i.e., no repositioning of the exons necessary). The exons of any trans-spliced gene (e.g., _rps12_), by contrast, undergo a two-step repositioning procedure before being concatenated. First, groups of contiguous exons are formed based on their location information: if an exon is adjacent to or even overlaps with another exon of the same gene name, they are merged. Second, exons of the same gene name are merged at the location of the first exon occurrence.
+---
 
-### Details on removal of user-specified genome regions from alignment
-Due to the size and complexity of large DNA sequence alignments, individual genome regions can barely be removed from a concatenated sequence alignment; instead, any user-specified exclusion of a genome region must be performed before the actual sequence alignment. `plastburstalign` contains two functions for such an exclusion: commandline-parameter `exclude_region` excludes any user-specified region by exact name match from the dataset; commandline-parameter `exclude_fullcds` removes entire user-specified genes as well as any introns inside, and any intergenic spacers immediately adjacent to, the specified genes from the dataset.
+### Doctor and troubleshooting
 
-### Details on automatic standardization of tRNA and rRNA gene names
-The names of all tRNAs are automatically standardized across the input genomes to counteract the accumulation of idiosyncratic gene names. tRNAs are often labeled differently by different researchers. For example, researcher A may label tRNAs with both amino acid abbreviations and anticodons (e.g., `trnA-Leu-UAA`), whereas researcher B may label them with the respective anticodons only (e.g., `trnA-UAA`). Similarly, researcher C may label tRNA genes with lower-case anticodons (e.g., `trnA-uaa`) but researcher D with upper-case anticodons (e.g., `trnA-UAA`). Differences in tRNA gene names may also originate from the idiosyncratic use of dashes versus underscores (e.g., `trnA-UAA` versus `trnA_UAA`). Leaving the names of tRNAs that code for the same gene unadjusted and, thus, incongruent across different input genomes risks the artificial increase in the number of unique genes, introns, and intergenic spacers in the dataset.
+```bash
+plastburstalign --doctor
+# or: plastburstalign --doctor --json
+```
 
-To ensure that only homologous genes are grouped together and aligned, `plastburstalign` automatically standardizes tRNA gene names across input genomes. Specifically, the software homogenizes incongruent tRNAs gene names to a single format: _tRNAabbreviation_anticodon_  (e.g., `trnA_UAA`). This format is (i) the most commonly used tRNA naming scheme among plastid genomes and (ii) the least problematic scheme for nucleotide sequence alignment operations, which typically interpret dashes as sequence characters. During the standardization operations, `plastburstalign` utilizes the [three-letter amino acid abbreviations](https://www.insdc.org/submitting-standards/feature-table/#7.4.3) and the [anticodon definitions](https://www.insdc.org/submitting-standards/genetic-code-tables/) of [translation table 11](https://www.insdc.org/submitting-standards/genetic-code-tables/) of the International Nucleotide Sequence Database Collaboration (INSDC). tRNAs with more than one possible codon but for which neither amino acid nor anticodon abbreviations are given in the gene name (e.g., `trnA` can be any of the following: `trnA_UAA`, `trnA_CAA`, `trnA_AAG`, `trnA_GAG`, `trnA_UAG`, and `trnA_CAG`), by contrast, are not changed by `plastburstalign` to avoid the incorrect designations.
+| Symptom | Check |
+|---------|--------|
+| `mafft: command not found` | Install MAFFT, set `--alignmenttoolpath` / `PBA_MAFFT`, or rely on the built-in aligner (slower; quality warning). `PBA_FORCE_BUILTIN_ALIGNER=1` forces the fallback. |
+| OOM / thrashing | Lower `-n`, raise free RAM, or pass `--memory-limit`; prefer tmpfs scratch (`--doctor` shows the tier). |
+| Non-identical repeats | Pass `--seed`; use `--subdivide off` when comparing across thread counts. |
+| Empty / tiny matrices | Relax `-t` / `-l`; inspect failed loci in logs and `run_manifest.json`. |
+| Slurm workers fail | Ensure the feature store and `--manifest` path are visible; workers do not need `-i` / `-s` when the store is populated. |
+| Strategy looks too aggressive | Constants may still be provisional—see [docs/calibration.md](docs/calibration.md). |
 
-For rRNAs, recognized gene names and RNA-product labels are standardized to the canonical plastid gene names: 16S rRNA to `rrn16`, 23S rRNA to `rrn23`, 4.5S rRNA to `rrn4.5`, and 5S rRNA to `rrn5`.
+More examples: [docs/exemplary_usage.md](docs/exemplary_usage.md). Benchmarking data: [docs/generating_benchmarking_data.md](docs/generating_benchmarking_data.md).
 
-As a side effect, the automatic standardization of tRNA gene names also decreases the number of annotated genome regions that need to be removed from the dataset for not reaching the minimum number of taxa defined. Without the standardization, the intergenic spacer between the genes `trnA_CAA` and `ndhB`, for example, may be grouped under two different names (e.g., `trnA_CAA_ndhB` and `trnA_caa_ndhB`), with the latter group being less common and eventually removed from the dataset for not reaching the minimum number of taxa. By implementing a gene name standardization, the same intergenic spacer is grouped under only one name (i.e., `trnA_CAA_ndhB`) and not discarded. Preliminary tests indicated that the number of annotated genome regions that were removed due to not reaching the minimum number of taxa was decreased by approximately 25% through the tRNA gene name standardization.
+---
+
+### Development
+
+```bash
+pip install -e ".[dev]"
+ruff check plastburstalign tests
+ruff format --check plastburstalign tests
+mypy plastburstalign
+python -m pytest -q tests
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md), [CHANGELOG.md](CHANGELOG.md), and [CITATION.cff](CITATION.cff). License: BSD-3-Clause ([LICENSE](LICENSE)).

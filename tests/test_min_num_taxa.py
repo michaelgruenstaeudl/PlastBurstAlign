@@ -30,10 +30,18 @@ class MinNumTaxaTests(unittest.TestCase):
             annotations={"molecule_type": "DNA"},
         )
         record.features = [
-            SeqFeature(FeatureLocation(0, 10), type="gene", qualifiers={"gene": ["trnH-GUG"]}),
-            SeqFeature(FeatureLocation(0, 10), type="tRNA", qualifiers={"gene": ["trnH-GUG"]}),
-            SeqFeature(FeatureLocation(10, 25), type="gene", qualifiers={"gene": ["psbA"]}),
-            SeqFeature(FeatureLocation(10, 25), type="CDS", qualifiers={"gene": ["psbA"]}),
+            SeqFeature(
+                FeatureLocation(0, 10), type="gene", qualifiers={"gene": ["trnH-GUG"]}
+            ),
+            SeqFeature(
+                FeatureLocation(0, 10), type="tRNA", qualifiers={"gene": ["trnH-GUG"]}
+            ),
+            SeqFeature(
+                FeatureLocation(10, 25), type="gene", qualifiers={"gene": ["psbA"]}
+            ),
+            SeqFeature(
+                FeatureLocation(10, 25), type="CDS", qualifiers={"gene": ["psbA"]}
+            ),
         ]
         return record
 
@@ -159,3 +167,5 @@ class MinNumTaxaTests(unittest.TestCase):
                 ExtractAndCollect(data, params)._extract_cds(
                     self.record(), data.nucleotides, data.proteins
                 )
+                with self.assertRaises(AttributeError):
+                    DataCleaning(data, params).clean()

@@ -1,125 +1,124 @@
-from typing import Optional, Dict, Any
-from Bio import SeqUtils
-from Bio.Seq import Seq
-from Bio.SeqRecord import SeqRecord
-from Bio.SeqFeature import FeatureLocation, ExactPosition, SeqFeature
-from Bio.Data import CodonTable
-from collections import OrderedDict, defaultdict
 import os
-from re import sub, findall, match
+from collections import OrderedDict, defaultdict
+from re import compile as re_compile
+from re import findall, match, sub
+from typing import Any, ClassVar, Optional
 
-# Package imports
+from Bio import SeqUtils
+from Bio.Data import CodonTable
+from Bio.Seq import Seq
+from Bio.SeqFeature import ExactPosition, FeatureLocation, SeqFeature
+from Bio.SeqRecord import SeqRecord
+
+from .extraction_report import ExtractionReport
 from .logging_ops import logger as log
+from .storage import DiskBackedFeatureStore, FeatureStoreView
+from .user_parameters import SelectMode
+
+# Anything outside the IUPAC nucleotide alphabet cannot be aligned: such a feature
+# is skipped (and reported) instead of poisoning its region.
+_INVALID_RESIDUES = re_compile(r"[^ACGTURYSWKMBDHVNacgturyswkmbdhvn]")
+# Region names become file names; real gene names are far shorter.
+MAX_REGION_NAME_CHARS = 100
 
 
 class PlastidData:
-    def __init__(self, user_params: Dict[str, Any]):
-        """
-        A data structure that primarily stores extracted sequence annotations.
-        Additionally, the source files to be extracted and the concatenation order of regions are stored.
+    mode: SelectMode
+    files: list[str]
+    num_taxa: int
+    order: str
+    store: DiskBackedFeatureStore
+    nucleotides: FeatureStoreView
+    proteins: FeatureStoreView | None
+    order_map: dict[str, int]
+    extraction_report: ExtractionReport
 
-        Args:
-            user_params: Specifications for how the data structure should be created and maintained.
-                These are `select_mode`, `in_dir`, `fileext`, and `order`.
+    def __init__(self, user_params: dict[str, Any]):
         """
+        Data structure to hold the extracted annotations.
+        """
+        self.user_params = user_params
         self._set_mode(user_params)
+        self._set_files(user_params)
         self._set_order_fun(user_params)
+        # filled by `ExtractAndCollect.extract()`; empty until then
+        self.extraction_report = ExtractionReport()
+
+        db_path = os.path.join(user_params.get("out_dir", "."), "feature_store.db")
+        self.store = DiskBackedFeatureStore(db_path)
+
         self._set_nucleotides()
         self._set_proteins()
-        self.order_map = None
-        self._set_files(user_params)
 
-    def _set_mode(self, user_params: Dict[str, Any]):
-        self.mode = user_params.get("select_mode")
+    def _set_mode(self, user_params: dict[str, Any]):
+        self.mode = user_params.get("select_mode")  # type: ignore[assignment]
 
     def _set_nucleotides(self):
-        self.nucleotides = IntergenicDict() if self.mode == "igs" else PlastidDict()
+        self.nucleotides = FeatureStoreView(self.store, "nucl")
 
     def _set_proteins(self):
-        self.proteins = PlastidDict() if self.mode.collects_proteins() else None
+        self.proteins = (
+            FeatureStoreView(self.store, "prot")
+            if self.mode.collects_proteins()
+            else None
+        )
 
-    def _set_files(self, user_params: Dict[str, Any]):
+    def _set_files(self, user_params: dict[str, Any]):
+        """Collects the input files in a deterministic (sorted by name) order.
+
+        `os.listdir` order is filesystem dependent; the position of a file in this
+        list becomes the `file_index` of its records and thereby the row order of
+        every alignment and of the concatenated supermatrix.
+
+        Cluster worker and finalizer runs operate on the existing feature store
+        only, so a missing input directory is tolerated there.
+        """
+        in_dir = user_params.get("in_dir")
+        is_cluster_worker_or_final = (
+            user_params.get("align_partition") is not None
+            or user_params.get("finalize_slurm") is True
+        )
+        try:
+            names = os.listdir(in_dir)
+        except OSError:
+            if not is_cluster_worker_or_final:
+                raise
+            names = []
+        fileext = user_params.get("fileext")
         self.files = [
-            os.path.join(user_params.get("in_dir"), f) for f in os.listdir(user_params.get("in_dir"))
-            if f.endswith(user_params.get("fileext"))
+            os.path.join(in_dir, f) for f in sorted(names) if f.endswith(fileext)
         ]
         self.num_taxa = len(self.files)
 
-    def _set_order_fun(self, user_params: Dict[str, Any]):
+    def _set_order_fun(self, user_params: dict[str, Any]):
         self.order = user_params.get("order")
 
-    @staticmethod
-    def _add_plast_dict(pdict1: 'PlastidDict', pdict2: 'PlastidDict'):
-        for feat_name in pdict2.keys():
-            if feat_name in pdict1.keys():
-                pdict1[feat_name].extend(pdict2[feat_name])
-            else:
-                pdict1[feat_name] = pdict2[feat_name]
+    def add_nucleotides(
+        self, pdict: Any, inv_map: dict[str, str] | None = None
+    ) -> None:
+        """Merges extracted dictionary into the disk store."""
+        if not pdict:
+            return
+        if inv_map is None:
+            is_igs = isinstance(pdict, IntergenicDict)
+            inv_map = getattr(pdict, "feat_name_inv_map", {}) if is_igs else None
 
-    def _add_igs_dict(self, pdict: 'IntergenicDict'):
-        self.nucleotides.feat_name_inv_map.update(pdict.feat_name_inv_map)
-        for feat_name in pdict.keys():
-            if feat_name in self.nucleotides.keys():
-                self.nucleotides[feat_name].extend(pdict[feat_name])
-            # Don't count IGS in the IRs twice
-            elif self.nucleotides.feat_name_inv_map.get(feat_name) in self.nucleotides.keys():
-                continue
-            else:
-                self.nucleotides[feat_name] = pdict[feat_name]
+        with self.store.transaction():
+            self.store.add_pdict(pdict, seq_type="nucl", inv_map=inv_map)
 
-    def add_nucleotides(self, pdict: 'PlastidDict'):
-        """
-        Merges a dictionary of region annotations into the dictionary of nucleotide region annotations
-        maintained by the data structure.
-
-        Args:
-            pdict: Dictionary of nucleotide region annotations.
-        """
-        if isinstance(pdict, IntergenicDict):
-            self._add_igs_dict(pdict)
-        else:
-            self._add_plast_dict(self.nucleotides, pdict)
-        self.nucleotides.plastome_feats.update(pdict.plastome_feats)
-
-    def add_proteins(self, pdict: 'PlastidDict'):
-        """
-        Merges a dictionary of region annotations into the dictionary of protein region annotations
-        maintained by the data structure. If the extraction mode does not include proteins, calling
-        this method will do nothing.
-
-        Args:
-            pdict: Dictionary of protein region annotations.
-        """
-        if self.mode.collects_proteins():
-            self._add_plast_dict(self.proteins, pdict)
-            self.proteins.plastome_feats.update(pdict.plastome_feats)
+    def add_proteins(self, pdict: Any) -> None:
+        """Merges extracted proteins into the disk store."""
+        if not pdict or not self.mode.collects_proteins():
+            return
+        with self.store.transaction():
+            self.store.add_pdict(pdict, seq_type="prot", inv_map=None)
 
     def set_order_map(self):
-        """
-        Orders the keys of the nucleotide dictionary according to `order`, creates a map from region name to ordinal
-        ordering, and sets this map as `order_map`.
-        """
-        order_list = list(self.nucleotides.keys())
-        if self.order == "alpha":
-            order_list.sort()
-        self.order_map = {
-            nuc: index for index, nuc in enumerate(order_list)
-        }
+        order_list = self.store.get_active_regions(self.order)
+        self.order_map = {nuc: index for index, nuc in enumerate(order_list)}
 
     def remove_nuc(self, feat_name: str):
-        """
-        Removes the specified region from the nucleotide dictionary. If the extraction mode includes proteins,
-        this will also remove the region from the protein dictionary.
-
-        Args:
-            feat_name: Name of the region to remove from the collected data.
-        """
-        if feat_name not in self.nucleotides.keys():
-            return
-
-        del self.nucleotides[feat_name]
-        if self.mode.collects_proteins():
-            del self.proteins[feat_name]
+        self.store.remove_region(feat_name)
 
 
 class PlastidDict(OrderedDict):
@@ -137,7 +136,7 @@ class PlastidDict(OrderedDict):
     def _is_feat(self, feat_name: str) -> bool:
         return feat_name in self.keys()
 
-    def add_feature(self, feature: 'PlastidFeature'):
+    def add_feature(self, feature: "PlastidFeature"):
         """
         Adds an annotation to the dictionary. If an annotation with the same name has already been added
         for the plastome (record name), it will not be added.
@@ -169,7 +168,7 @@ class IntergenicDict(PlastidDict):
         super().__init__()
         self.feat_name_inv_map = {}
 
-    def add_feature(self, igs: 'IntergenicFeature'):
+    def add_feature(self, igs: "IntergenicFeature"):
         super().add_feature(igs)
         self.feat_name_inv_map[igs.feat_name] = igs.inv_feat_name
 
@@ -178,7 +177,7 @@ class IntergenicDict(PlastidDict):
 
 
 class GeneNameCleaner:
-    _rrna_gene_names = {
+    _rrna_gene_names: ClassVar[dict[str, str]] = {
         "16s": "rrn16",
         "16srrna": "rrn16",
         "16sribosomalrna": "rrn16",
@@ -282,16 +281,14 @@ class GeneNameCleaner:
         gene_sub = match(gene_pattern, gene)
         # if non-standard, just return a "safe" version of the name
         if not gene_sub:
-            return sub(
-                r"\W+", "_", gene.replace("-", "_")
-            )
+            return sub(r"\W+", "_", gene.replace("-", "_"))
         # the first match is the beginning of the cleaned name
         cleaned_gene = gene_sub.group()[0:3].lower() + gene_sub.group()[3:].upper()
         if cut_trna:
             return cleaned_gene
 
         # look for tRNA qualifiers
-        gene = gene[len(cleaned_gene):]
+        gene = gene[len(cleaned_gene) :]
         trna_pattern = r"([a-zA-Z]{3})"
         qual_subs = findall(trna_pattern, gene)
         # if not tRNA, return the gene
@@ -389,14 +386,32 @@ class PlastidFeature:
 
     def _set_seq_obj(self, record: SeqRecord):
         try:
-            self.seq_obj = self.feature.extract(record).seq
+            seq = self.feature.extract(record).seq
+            bad = _INVALID_RESIDUES.search(str(seq))
+            if bad:
+                raise ValueError(
+                    f"invalid nucleotide character {bad.group()!r} at position"
+                    f" {bad.start() + 1} of the feature"
+                )
+            self.seq_obj = seq
         except Exception as e:
             self._set_exception(e)
 
     def _set_seq_name(self):
         self.seq_name = f"{self.feat_name}_{self.rec_name}"
+        if (
+            isinstance(self.feat_name, str)
+            and len(self.feat_name) > MAX_REGION_NAME_CHARS
+        ):
+            self.seq_obj = None
+            self._set_exception(
+                ValueError(
+                    f"region name of {len(self.feat_name)} characters exceeds the"
+                    f" {MAX_REGION_NAME_CHARS} character limit"
+                )
+            )
 
-    def _set_exception(self, exception: Exception = None):
+    def _set_exception(self, exception: Exception | None = None):
         if exception is None:
             self._exception = self._default_exception
             self._log_fun = lambda x: None
@@ -412,8 +427,12 @@ class PlastidFeature:
             A string describing the `SeqRecord` status.
 
         """
-        message = f"skipped due to {self._exception}" if self._exception else "successful"
-        status = f"parsing of {self._type} '{self.feat_name}' in {self.rec_name} {message}"
+        message = (
+            f"skipped due to {self._exception}" if self._exception else "successful"
+        )
+        status = (
+            f"parsing of {self._type} '{self.feat_name}' in {self.rec_name} {message}"
+        )
         return status
 
     def log_exception(self):
@@ -437,9 +456,7 @@ class PlastidFeature:
 
         """
         if self.seq_obj:
-            return SeqRecord(
-                self.seq_obj, id=self.seq_name, name="", description=""
-            )
+            return SeqRecord(self.seq_obj, id=self.seq_name, name="", description="")
         return None
 
 
@@ -463,6 +480,8 @@ class GeneFeature(PlastidFeature):
         """
         Accesses if a proper reading frame exists for the gene.
         """
+        if self.seq_obj is None:  # extraction failed; the exception is recorded
+            return
         trim_char = len(self.seq_obj) % 3
         if trim_char > 0 and self.seq_obj[:3] == "ATG":
             self.seq_obj = self.seq_obj[:-trim_char]
@@ -476,7 +495,12 @@ class ProteinFeature(GeneFeature):
     _type = "protein"
     _default_exception = "potential reading frame error of this feature in input file"
 
-    def __init__(self, record: SeqRecord = None, feature: SeqFeature = None, gene: GeneFeature = None):
+    def __init__(
+        self,
+        record: SeqRecord = None,
+        feature: SeqFeature = None,
+        gene: GeneFeature = None,
+    ):
         """
         Primarily a wrapper for a protein `SeqRecord` that can be accessed by `get_record()`.
         It contains other variables and methods that document the creation of the `SeqRecord`.
@@ -504,7 +528,9 @@ class ProteinFeature(GeneFeature):
             return
 
         try:
-            self.seq_obj = self.seq_obj.translate(table=11)  # Getting error TTA is not stop codon.
+            self.seq_obj = self.seq_obj.translate(
+                table=11
+            )  # Getting error TTA is not stop codon.
         except Exception as e:
             self._set_exception(e)
 
@@ -536,20 +562,18 @@ class IntronFeature(PlastidFeature):
         in_order = exon_2.start >= exon_1.end
 
         if in_order:
-            self.feature.location = FeatureLocation(
-                exon_1.end, exon_2.start
-            )
+            self.feature.location = FeatureLocation(exon_1.end, exon_2.start)
         else:
-            self.feature.location = FeatureLocation(
-                exon_2.start, exon_1.end
-            )
+            self.feature.location = FeatureLocation(exon_2.start, exon_1.end)
 
 
 class IntergenicFeature(PlastidFeature):
     _type = "intergenic spacer"
     _default_exception = "negative intergenic length in input file"
 
-    def __init__(self, record: SeqRecord, current_feat: SeqFeature, subsequent_feat: SeqFeature):
+    def __init__(
+        self, record: SeqRecord, current_feat: SeqFeature, subsequent_feat: SeqFeature
+    ):
         """
         Primarily a wrapper for an intergenic spacer `SeqRecord` that can be accessed by `get_record()`.
         It contains other variables and methods that document the creation of the `SeqRecord`.
@@ -570,10 +594,14 @@ class IntergenicFeature(PlastidFeature):
         # Note: It's unclear if +1 is needed here.
         self.start_pos = ExactPosition(current_feat.location.end)  # +1)
         self.end_pos = ExactPosition(self.subsequent_feat.location.start)
-        self.feature = FeatureLocation(self.start_pos, self.end_pos) if self.start_pos < self.end_pos else None
+        self.feature = (
+            FeatureLocation(self.start_pos, self.end_pos)
+            if self.start_pos < self.end_pos
+            else None
+        )
         self.default_exception = (
-                f"{IntergenicFeature._default_exception}"
-                f" (start pos: {self.start_pos}, end pos:{self.end_pos})"
+            f"{IntergenicFeature._default_exception}"
+            f" (start pos: {self.start_pos}, end pos:{self.end_pos})"
         )
 
     def _set_seq_obj(self, record: SeqRecord):
