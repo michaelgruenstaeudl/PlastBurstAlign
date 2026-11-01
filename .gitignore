@@ -40,3 +40,19 @@ plastbench_results*.json
 # Tracked golden files of the parity gate must never be ignored
 !tests/golden/
 !tests/golden/**
+
+# Local benchmarking and scratch output
+test_run_*/
+benchmark_results_*
+*.db
+*.db-wal
+*.db-shm
+*_metrics.csv
+
+# Cluster batch scripts and SLURM logs
+*.slurm
+*.err
+*.log
+slurm-*.out
+slurm_*.out
+slurm_logs/
