@@ -90,6 +90,7 @@ class Host:
         return pid in self.alive
 
     def env(self, **kw: object) -> ScratchEnvironment:
+        kw.setdefault("platform", "linux")
         return ScratchEnvironment(
             disk_usage=self.disk_usage,
             available_ram=self.available_ram,

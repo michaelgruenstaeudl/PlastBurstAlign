@@ -1499,7 +1499,13 @@ def _detect_uncached(
         env=env,
         system=system if system is not None else platform.system(),
         machine=machine if machine is not None else platform.machine(),
-        sysctl=sysctl if sysctl is not None else _default_sysctl,
+        sysctl=sysctl
+        if sysctl is not None
+        else (
+            _default_sysctl
+            if os.path.abspath(root) == os.path.abspath(os.sep)
+            else (lambda _: None)
+        ),
         disk_usage=disk_usage if disk_usage is not None else _make_disk_usage(root),
         use_psutil=use_psutil,
         affinity_override=affinity,

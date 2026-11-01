@@ -787,7 +787,7 @@ class DeterminismTests(unittest.TestCase):
         reference = SupermatrixBuilder(
             self.sources, rename=legacy_concat_rename, max_workers=1
         ).build()
-        delays = [0.02 * (len(self.sources) - i) for i in range(len(self.sources))]
+        delays = [0.05 * (len(self.sources) - i) for i in range(len(self.sources))]
         builder = DelayedBuilder(
             self.sources,
             delays=delays,
@@ -855,12 +855,13 @@ for k in range(nloci):
     path.write_bytes(b"".join(parts))
     sources.append(LocusSource(f"loc{k}", path, "cds", True))
 del data, parts
-rss0 = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
+_scale = 1 if sys.platform == "darwin" else 1024
+rss0 = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * _scale
 t0 = time.perf_counter()
 sm = SupermatrixBuilder(sources, rename=legacy_concat_rename, trim=sys.argv[5] if sys.argv[5] != "none" else None,
                         buffer=sys.argv[6], scratch_dir=out, max_workers=4).build()
 elapsed = time.perf_counter() - t0
-rss1 = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
+rss1 = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * _scale
 print(json.dumps({"ntax": sm.ntax, "nchar": sm.nchar, "nbytes": sm.nbytes,
                   "seconds": elapsed, "rss_before": rss0, "rss_after": rss1,
                   "informative": sm.informative_sites, "density": sm.density,

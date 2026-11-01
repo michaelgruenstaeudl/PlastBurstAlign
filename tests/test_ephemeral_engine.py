@@ -25,7 +25,8 @@ class TestEphemeralScratchEngine(unittest.TestCase):
 
     def test_custom_scratch_directory_override(self):
         with EphemeralScratchManager(custom_scratch_dir="/tmp") as mgr:
-            self.assertTrue(str(mgr.path).startswith("/tmp/pba_"))
+            self.assertEqual(mgr.path.parent, Path("/tmp").resolve())
+            self.assertTrue(mgr.path.name.startswith("pba_"))
             self.assertTrue(mgr.path.exists())
 
     def test_mafft_aligner_passes_ephemeral_tmpdir(self):

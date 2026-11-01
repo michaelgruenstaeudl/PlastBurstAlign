@@ -116,7 +116,22 @@ def cpu_model() -> str:
     return f"{name} ({os.cpu_count()} logical cpus)"
 
 
-GNU_TIME = "/usr/bin/time"
+def _detect_gnu_time() -> str | None:
+    for cand in ("gtime", "/usr/bin/time"):
+        p = shutil.which(cand)
+        if p and os.access(p, os.X_OK):
+            try:
+                proc = subprocess.run(
+                    [p, "--version"], capture_output=True, text=True, timeout=2
+                )
+                if "GNU" in (proc.stdout + proc.stderr):
+                    return p
+            except Exception:
+                pass
+    return None
+
+
+GNU_TIME = _detect_gnu_time()
 
 
 def run_timed(
@@ -134,7 +149,7 @@ def run_timed(
     env = dict(os.environ, TMPDIR=tmpdir)
     rss_file = os.path.join(tmpdir, "rss.txt")
     wrapped = list(cmd)
-    if os.access(GNU_TIME, os.X_OK):
+    if GNU_TIME is not None:
         wrapped = [GNU_TIME, "-f", "%M", "-o", rss_file, *cmd]
     start = time.perf_counter()
     proc = subprocess.Popen(
