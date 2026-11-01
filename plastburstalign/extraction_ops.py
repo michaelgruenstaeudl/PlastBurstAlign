@@ -1,14 +1,16 @@
 import bisect
 import os
-from collections.abc import Generator
+from collections.abc import Generator, Iterator
 from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from copy import deepcopy
 from typing import Any, NamedTuple
 
 from Bio.SeqFeature import CompoundLocation, FeatureLocation, SeqFeature
 from Bio.SeqRecord import SeqRecord
 
-from .genbank_scanner import fast_read_genbank
+from .extraction_report import ExtractionError, ExtractionReport
+from .genbank_scanner import GenBankParseError, fast_read_genbank
 from .helpers import ordered_bounded_map, split_list
 from .logging_ops import Logger
 from .logging_ops import logger as log
@@ -28,6 +30,147 @@ from .task_queue import get_mp_context
 
 # Flattened extraction results: region -> [(record id, description, sequence, file index)]
 FlatRecords = dict[str, list[tuple[str, str, str, int]]]
+
+
+def _mode_key(mode_str: object) -> str:
+    """``SelectMode.CDS`` and ``cds`` both become ``cds``."""
+    return str(mode_str).rsplit(".", 1)[-1].lower()
+
+
+def _feature_label(feature: object) -> str:
+    """Short, single-line description of a feature for the report."""
+    if isinstance(feature, str):
+        return feature
+    try:
+        ftype = getattr(feature, "type", "?")
+        quals = getattr(feature, "qualifiers", {}) or {}
+        gene_vals = quals.get("gene") if isinstance(quals, dict) else None
+        gene = gene_vals[0] if gene_vals else ""
+        loc = getattr(feature, "location", "")
+        return f"{ftype} {gene} {loc}".strip()
+    except Exception:
+        return "feature"
+
+
+def _has_regions(nuc: Any, prot: Any) -> bool:
+    return bool(nuc) or bool(prot)
+
+
+def _shutdown_pool(executor: ProcessPoolExecutor, *, broken: bool) -> None:
+    """Stop a pool without waiting forever on a worker that already died.
+
+    ``shutdown(wait=True)`` joins the pool's management thread. After a worker
+    is killed that join can block (the thread is stuck terminating children),
+    and the thread is not a daemon, so the interpreter then never exits.
+    Broken pools are therefore cancelled, their children are killed, and the
+    management thread is given a short grace period.
+    """
+    processes = list((getattr(executor, "_processes", None) or {}).values())
+    thread = getattr(executor, "_executor_manager_thread", None)
+    try:
+        executor.shutdown(wait=False, cancel_futures=True)
+    except Exception:
+        log.debug("extraction pool shutdown failed", exc_info=True)
+    if broken:
+        for proc in processes:
+            if not proc.is_alive():
+                continue
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        for proc in processes:
+            try:
+                proc.join(timeout=0.5)
+            except Exception:
+                pass
+    if thread is not None and thread.is_alive():
+        thread.join(timeout=2.0 if broken else 120.0)
+
+
+def _note_scan(report: ExtractionReport, file: str, record: SeqRecord) -> None:
+    """Copy scanner skip/truncation notes onto the extraction report."""
+    ann = record.annotations or {}
+    raw = ann.get("pba_skipped_features") or 0
+    try:
+        n_skipped = int(raw)
+    except (TypeError, ValueError):
+        n_skipped = 0
+    if n_skipped:
+        details = str(ann.get("pba_skipped_feature_details") or "")
+        lines = [ln for ln in details.splitlines() if ln]
+        for line in lines:
+            feature, sep, reason = line.partition(": ")
+            if not sep:
+                feature, reason = "feature", line
+            report.add_feature_failure(file, "scan", feature, reason)
+        report.add_unlisted_feature_failures("scan", n_skipped - len(lines))
+        log.warning(
+            "%s: skipped %d feature(s) that could not be parsed",
+            os.path.basename(file),
+            n_skipped,
+        )
+    extra = ann.get("pba_extra_records") or 0
+    if extra:
+        report.add_warning(file, f"{extra} additional record(s) were ignored")
+    truncated = ann.get("pba_truncated_qualifiers") or 0
+    if truncated:
+        report.add_warning(
+            file,
+            f"{truncated} qualifier value(s) were truncated to the size limit",
+        )
+
+
+def _unpack_worker_result(
+    res: Any,
+) -> tuple[Any, Any, dict[str, str], ExtractionReport | None]:
+    """Accept 2-tuples, 3-tuples, and report-bearing results.
+
+    Existing callers unpack ``nuc, prot, inv = result``. A :class:`ChunkResult`
+    still does that (``len`` is 3) and carries ``.report``. A plain 4-tuple whose
+    last item is an :class:`ExtractionReport` is accepted too.
+    """
+    report = getattr(res, "report", None)
+    n = len(res)
+    if n == 2:
+        nuc, prot = res
+        inv: dict[str, str] = {}
+    elif n == 3:
+        nuc, prot, inv = res
+    elif n >= 4:
+        nuc, prot, inv = res[0], res[1], res[2]
+        if report is None and isinstance(res[3], ExtractionReport):
+            report = res[3]
+    else:
+        raise TypeError(
+            f"extraction worker returned {n} value(s); expected 2, 3, or a"
+            " report-bearing result"
+        )
+    return nuc, prot, inv, report
+
+
+class ChunkResult(tuple):
+    """``(nucleotides, proteins, inverse_name_map)`` plus an extraction report.
+
+    ``nuc, prot, inv = result`` and ``len(result) == 3`` stay valid. ``report``
+    is pickled across the process boundary with the three flattened dictionaries.
+    """
+
+    report: ExtractionReport
+
+    def __new__(
+        cls,
+        nuc: FlatRecords | None,
+        prot: FlatRecords | None,
+        inv: dict[str, str],
+        report: ExtractionReport,
+    ) -> "ChunkResult":
+        obj = tuple.__new__(cls, (nuc, prot, inv))
+        obj.report = report
+        return obj
+
+    def __reduce__(self) -> tuple[Any, tuple[Any, ...]]:
+        return (ChunkResult, (self[0], self[1], self[2], self.report))
 
 
 class ExtractAndCollect:
@@ -82,6 +225,12 @@ class ExtractAndCollect:
         the position of its source file in `plastid_data.files` (its `file_index`),
         and the chunk results are committed to the store strictly in submission
         order through a bounded reorder window.
+
+        A feature that cannot be read is skipped. A file that cannot be read is
+        skipped. A worker that dies (or raises) takes only its chunk down; that
+        chunk is re-run one file at a time and healthy chunks are kept. The run
+        is fatal only when no file yields a region. What was skipped is recorded
+        on ``plastid_data.extraction_report``.
         """
         log.info(
             f"parsing GenBank flatfiles and extracting their sequence annotations using "
@@ -95,15 +244,14 @@ class ExtractAndCollect:
         # Resolve mode primitives once upfront so they are available regardless of ordering
         mode_str = getattr(self.plastid_data.mode, "mode", str(self.plastid_data.mode))
         collects_proteins = self.plastid_data.mode.collects_proteins()
+        report = self.plastid_data.extraction_report
 
         def commit(res) -> None:
-            if len(res) == 3:
-                nuc_dict, prot_dict, inv_map = res
-            else:
-                nuc_dict, prot_dict = res
-                inv_map = {}
+            nuc_dict, prot_dict, inv_map, chunk_report = _unpack_worker_result(res)
             self.plastid_data.add_nucleotides(nuc_dict, inv_map=inv_map)
             self.plastid_data.add_proteins(prot_dict)
+            if chunk_report is not None:
+                report.merge(chunk_report)
 
         # Position of the first not-yet-processed file in the ordered file list
         next_file_index = 0
@@ -111,19 +259,33 @@ class ExtractAndCollect:
         # Step 0. Extract first genome in list for feature ordering
         if self.plastid_data.order == "seq":
             first_genome = self.plastid_data.files.pop(0)
-            commit(
-                self._extract_recs_static(
-                    [first_genome],
-                    mode_str,
-                    collects_proteins,
-                    self.exclude_cds,
-                    self.include_trna,
-                    self.include_rrna,
-                    self.min_seq_length,
-                    self.verbose,
+            try:
+                commit(
+                    self._extract_recs_static(
+                        [first_genome],
+                        mode_str,
+                        collects_proteins,
+                        self.exclude_cds,
+                        self.include_trna,
+                        self.include_rrna,
+                        self.min_seq_length,
+                        self.verbose,
+                        next_file_index,
+                    )
+                )
+            except Exception as exc:
+                report.files_total += 1
+                report.add_file_failure(
+                    first_genome,
+                    "worker",
+                    f"{type(exc).__name__}: {exc}",
                     next_file_index,
                 )
-            )
+                log.error(
+                    " {!r} generated an exception: {}".format(
+                        os.path.basename(first_genome), exc
+                    )
+                )
             next_file_index += 1
 
         # Step 1. Chunk remaining files for parallel workers
@@ -157,26 +319,202 @@ class ExtractAndCollect:
                 )
             next_file_index += len(chunk)
 
-        # Step 2. Use ProcessPoolExecutor to parallelize extraction with a bounded
-        # queue; results are committed in submission order (deterministic row order)
-        mp_context = get_mp_context()
-        max_in_flight = self.num_threads * 2
+        # Step 2. Parallel extraction. A broken worker is isolated to its chunk;
+        # that chunk is then re-run one file at a time. Commit order stays the
+        # submission order, including across a pool restart.
+        if chunk_args:
+            self._extract_chunks(chunk_args, commit)
 
-        with ProcessPoolExecutor(
-            max_workers=self.num_threads, mp_context=mp_context
-        ) as executor:
-            for _, future in ordered_bounded_map(
-                executor,
-                self._worker_wrapper,
-                chunk_args,
-                window=max_in_flight,
-            ):
-                commit(future.result())
+        if not report.ok:
+            log.warning(report.summary())
 
         # Step 3. Stop execution if no nucleotides were extracted (O(1) DB query)
         if len(self.plastid_data.nucleotides) == 0:
-            log.critical(f"No items in main dictionary: {self.out_dir}")
-            raise Exception()
+            message = self._fatal_message()
+            log.critical(message)
+            raise ExtractionError(message, report)
+
+    def _fatal_message(self) -> str:
+        report = self.plastid_data.extraction_report
+        mode = getattr(self.plastid_data.mode, "value", None) or str(
+            self.plastid_data.mode
+        )
+        return (
+            f"No items in main dictionary: {self.out_dir}\n"
+            f"No usable records were extracted in mode {mode} from "
+            f"{report.files_total} file(s) "
+            f"({report.files_failed} failed, "
+            f"{report.features_skipped} feature(s) skipped). "
+            "Nothing was written because every file failed or contained no "
+            f"features for mode {mode}. Check that the inputs are GenBank "
+            "flatfiles and that they annotate the features this mode reads "
+            "(CDS, gene, tRNA, rRNA).\n"
+            f"{report.summary()}"
+        )
+
+    def _extract_chunks(self, chunk_args: list[tuple], commit) -> None:
+        """Run chunks, restarting the pool after a worker crash.
+
+        Chunks that already committed stay committed. The chunk whose worker
+        died is re-run one file at a time; the chunks after it are submitted
+        to a new pool.
+        """
+        pending = list(chunk_args)
+        # One restart per chunk is enough; the guard stops a pool that can
+        # never make progress from looping.
+        for _ in range(len(chunk_args) + 1):
+            if not pending:
+                return
+            done = self._run_chunk_pool(pending, commit)
+            if done <= 0:
+                self._isolate_chunk(
+                    pending[0],
+                    commit,
+                    RuntimeError("worker pool failed before returning a result"),
+                    use_subprocess=True,
+                )
+                pending = pending[1:]
+                continue
+            pending = pending[done:]
+        for item in pending:
+            self._isolate_chunk(
+                item,
+                commit,
+                RuntimeError("extraction stopped making progress"),
+                use_subprocess=False,
+            )
+
+    def _run_chunk_pool(self, chunk_args: list[tuple], commit) -> int:
+        """Commit ``chunk_args`` in order. Returns how many leading chunks finished.
+
+        On :class:`BrokenProcessPool` the chunk that raised is isolated and
+        counted as finished; the caller retries everything after it on a new
+        pool. A normal exception from the worker function isolates that chunk
+        and the same pool keeps going.
+        """
+        ex = ProcessPoolExecutor(
+            max_workers=self.num_threads, mp_context=get_mp_context()
+        )
+        finished = 0
+        broken = False
+        try:
+            try:
+                for item, fut in ordered_bounded_map(
+                    ex,
+                    self._worker_wrapper,
+                    chunk_args,
+                    window=max(1, self.num_threads * 2),
+                ):
+                    try:
+                        res = fut.result()
+                    except BrokenProcessPool as exc:
+                        broken = True
+                        self._isolate_chunk(item, commit, exc, use_subprocess=True)
+                        finished += 1
+                        break
+                    except Exception as exc:
+                        self._isolate_chunk(item, commit, exc, use_subprocess=False)
+                    else:
+                        commit(res)
+                    finished += 1
+            except BrokenProcessPool as exc:
+                # The pool died while submitting or while the generator was
+                # cleaning up. Isolate the chunk we had not yet finished.
+                if not broken and finished < len(chunk_args):
+                    self._isolate_chunk(
+                        chunk_args[finished], commit, exc, use_subprocess=True
+                    )
+                    finished += 1
+            except Exception as exc:
+                # Generator cleanup after a crash is not another failed chunk.
+                if broken:
+                    log.debug(
+                        "extraction pool cleanup failed after a worker crash: %s",
+                        exc,
+                    )
+                elif finished < len(chunk_args):
+                    self._isolate_chunk(
+                        chunk_args[finished], commit, exc, use_subprocess=False
+                    )
+                    finished += 1
+        finally:
+            _shutdown_pool(ex, broken=broken)
+        return finished
+
+    def _isolate_chunk(
+        self,
+        args: tuple,
+        commit,
+        exc: BaseException,
+        *,
+        use_subprocess: bool,
+    ) -> None:
+        """Re-run one chunk's files one at a time. Healthy files are kept."""
+        files = list(args[0])
+        start = int(args[-1])
+        report = self.plastid_data.extraction_report
+        report.chunks_retried += 1
+        if isinstance(exc, BrokenProcessPool):
+            report.worker_crashes += 1
+        first = os.path.basename(files[0]) if files else "?"
+        log.warning(
+            "extraction worker failed on a chunk of %d file(s) starting with %s"
+            " (%s: %s); re-running those files one at a time",
+            len(files),
+            first,
+            type(exc).__name__,
+            exc,
+        )
+        for i, path in enumerate(files):
+            one = ([path], *args[1:-1], start + i)
+            try:
+                if use_subprocess:
+                    res = self._one_file_process(one)
+                else:
+                    res = self._extract_recs_static(*one)
+            except BrokenProcessPool as file_exc:
+                report.worker_crashes += 1
+                report.files_total += 1
+                report.add_file_failure(
+                    path,
+                    "worker",
+                    f"worker process died: {file_exc}",
+                    start + i,
+                )
+                log.error(
+                    " {!r} generated an exception: {}".format(
+                        os.path.basename(path), file_exc
+                    )
+                )
+            except Exception as file_exc:
+                report.files_total += 1
+                report.add_file_failure(
+                    path,
+                    "worker",
+                    f"{type(file_exc).__name__}: {file_exc}",
+                    start + i,
+                )
+                log.error(
+                    " {!r} generated an exception: {}".format(
+                        os.path.basename(path), file_exc
+                    )
+                )
+            else:
+                commit(res)
+
+    def _one_file_process(self, args: tuple) -> Any:
+        """Run one file in its own process so a crash cannot kill the parent."""
+        ex = ProcessPoolExecutor(max_workers=1, mp_context=get_mp_context())
+        broken = False
+        try:
+            future = ex.submit(self._worker_wrapper, args)
+            try:
+                return future.result()
+            except BrokenProcessPool:
+                broken = True
+                raise
+        finally:
+            _shutdown_pool(ex, broken=broken)
 
     @staticmethod
     def _extract_recs_static(
@@ -189,8 +527,11 @@ class ExtractAndCollect:
         min_seq_length: int,
         verbose: bool,
         start_index: int = 0,
-    ) -> tuple[FlatRecords | None, FlatRecords | None, dict[str, str]]:
+    ) -> ChunkResult:
         """Static worker function isolated from sqlite connections.
+
+        The return value unpacks as ``(nucleotides, proteins, inverse_name_map)``.
+        It also carries an :class:`ExtractionReport` for this chunk.
 
         Args:
             files: GenBank files of this chunk, a contiguous slice of the ordered
@@ -215,35 +556,91 @@ class ExtractAndCollect:
             def __init__(self):
                 self.mode = MockMode(mode_str, collects_proteins)
 
-        def extract_rec(file: str, n_dict: PlastidDict, p_dict: PlastidDict | None):
+        mode_key = _mode_key(mode_str)
+        report = ExtractionReport()
+
+        def extract_rec(
+            file: str,
+            n_dict: PlastidDict,
+            p_dict: PlastidDict | None,
+            file_index: int,
+        ) -> None:
+            report.files_total += 1
             try:
                 log.info(f" parsing {os.path.basename(file)}")
                 record = fast_read_genbank(file)
-
-                extractor = ExtractAndCollect.__new__(ExtractAndCollect)
-                extractor.plastid_data = MockData()
-                extractor.exclude_cds = exclude_cds or []
-                extractor.exclude_region = []
-                extractor.include_trna = include_trna
-                extractor.include_rrna = include_rrna
-                extractor.min_seq_length = min_seq_length
-
-                if mode_str == "SelectMode.CDS":
-                    extractor._extract_cds(record, n_dict, p_dict)
-                elif mode_str == "SelectMode.IGS":
-                    extractor._extract_igs(record, n_dict)
-                elif mode_str == "SelectMode.INT":
-                    extractor._extract_int(record, n_dict)
-                elif mode_str == "SelectMode.RNA":
-                    extractor._extract_rna(record, n_dict)
-
-            except Exception as e:
+            except GenBankParseError as exc:
+                report.add_file_failure(file, exc.stage, exc.reason, file_index)
                 log.error(
-                    " {!r} generated an exception: {}".format(os.path.basename(file), e)
+                    " {!r} generated an exception: {}".format(
+                        os.path.basename(file), exc
+                    )
+                )
+                return
+            except Exception as exc:
+                stage = "read" if isinstance(exc, OSError) else "parse"
+                report.add_file_failure(
+                    file, stage, f"{type(exc).__name__}: {exc}", file_index
+                )
+                log.error(
+                    " {!r} generated an exception: {}".format(
+                        os.path.basename(file), exc
+                    )
+                )
+                return
+
+            _note_scan(report, file, record)
+            extractor = ExtractAndCollect.__new__(ExtractAndCollect)
+            extractor.plastid_data = MockData()
+            extractor.exclude_cds = exclude_cds or []
+            extractor.exclude_region = []
+            extractor.include_trna = include_trna
+            extractor.include_rrna = include_rrna
+            extractor.min_seq_length = min_seq_length
+            extractor._report = report
+            extractor._source_file = file
+            try:
+                if mode_key == "cds":
+                    extractor._extract_cds(record, n_dict, p_dict)
+                elif mode_key == "igs":
+                    extractor._extract_igs(record, n_dict)
+                elif mode_key == "int":
+                    extractor._extract_int(record, n_dict)
+                elif mode_key == "rna":
+                    extractor._extract_rna(record, n_dict)
+                else:
+                    report.add_file_failure(
+                        file,
+                        "extract",
+                        f"undefined extraction mode {mode_str!r}",
+                        file_index,
+                    )
+                    return
+            except Exception as exc:
+                # Features already added to the dictionaries are kept.
+                report.add_file_failure(
+                    file, "extract", f"{type(exc).__name__}: {exc}", file_index
+                )
+                log.error(
+                    " {!r} generated an exception: {}".format(
+                        os.path.basename(file), exc
+                    )
+                )
+                if _has_regions(n_dict, p_dict):
+                    report.files_with_regions += 1
+                return
+
+            if _has_regions(n_dict, p_dict):
+                report.files_ok += 1
+                report.files_with_regions += 1
+            else:
+                report.files_ok += 1
+                report.add_warning(
+                    file, "parsed, but no regions were extracted for this mode"
                 )
 
         Logger.reinitialize_logger(verbose)
-        is_igs = mode_str == "SelectMode.IGS"
+        is_igs = mode_key == "igs"
 
         # Flatten records into lightweight primitive tuples to eliminate IPC pickling overhead
         def _flatten_into(
@@ -271,17 +668,79 @@ class ExtractAndCollect:
         for offset, f in enumerate(files):
             nuc_dict = IntergenicDict() if is_igs else PlastidDict()
             prot_dict = PlastidDict() if collects_proteins else None
-            extract_rec(f, nuc_dict, prot_dict)
+            extract_rec(f, nuc_dict, prot_dict, start_index + offset)
             _flatten_into(flat_nuc, nuc_dict, start_index + offset)
             _flatten_into(flat_prot, prot_dict, start_index + offset)
             inv_map.update(getattr(nuc_dict, "feat_name_inv_map", {}))
 
-        return flat_nuc or None, flat_prot or None, inv_map
+        return ChunkResult(flat_nuc or None, flat_prot or None, inv_map, report)
 
     @staticmethod
     def _worker_wrapper(args_tuple):
         """Unpacks arguments from the iterator into the static worker."""
         return ExtractAndCollect._extract_recs_static(*args_tuple)
+
+    def _source_of(self, rec: SeqRecord | None) -> str:
+        src = getattr(self, "_source_file", None)
+        if src:
+            return str(src)
+        if rec is not None and getattr(rec, "name", None):
+            return str(rec.name)
+        return ""
+
+    def _skip_feature(
+        self, rec: SeqRecord | None, stage: str, feature: object, exc: BaseException
+    ) -> None:
+        """Record one feature and keep going. The rest of the genome is extracted."""
+        label = _feature_label(feature)
+        reason = f"{type(exc).__name__}: {exc}"
+        src = self._source_of(rec)
+        log.warning("skipping %s [%s] in %s: %s", label, stage, src or "record", reason)
+        report = getattr(self, "_report", None)
+        if report is not None:
+            report.add_feature_failure(src, stage, label, reason)
+
+    def _note_rejected(
+        self, rec: SeqRecord, stage: str, feature: SeqFeature, obj: Any
+    ) -> None:
+        """Record a feature whose sequence could not be read.
+
+        Reading-frame skips store a plain string on the feature and stay quiet,
+        matching the historical ``log_exception`` behaviour on valid input.
+        """
+        exc = getattr(obj, "_exception", None)
+        if isinstance(exc, BaseException):
+            self._skip_feature(rec, stage, feature, exc)
+
+    def _drain_problems(
+        self, rec: SeqRecord, features: "RecordFeatures", stage: str
+    ) -> None:
+        problems = getattr(features, "_problems", ())
+        if not problems:
+            return
+        report = getattr(self, "_report", None)
+        src = self._source_of(rec)
+        for label, reason in problems:
+            log.warning(
+                "skipping %s [%s] in %s: %s", label, stage, src or "record", reason
+            )
+            if report is not None:
+                report.add_feature_failure(src, stage, label, reason)
+
+    def _iter_features(
+        self, rec: SeqRecord, features: Iterator[SeqFeature], stage: str
+    ) -> Iterator[SeqFeature]:
+        """Yield features, stopping the generator without aborting the caller."""
+        iterator = iter(features)
+        while True:
+            try:
+                feature = next(iterator)
+            except StopIteration:
+                return
+            except Exception as exc:
+                self._skip_feature(rec, stage, "remaining features", exc)
+                return
+            yield feature
 
     def _extract_cds(
         self,
@@ -292,98 +751,126 @@ class ExtractAndCollect:
         """
         Extracts all CDS (coding sequences = genes) from a given sequence record
         """
-        for feature in RecordFeatures(rec, self.exclude_cds).cds_feats:
-            if len(feature.location) < self.min_seq_length:
-                continue
-            feat_name = PlastidFeature.name_cleaner.get_safe_gene(feature)
-            if self._is_region_excluded(feat_name):
-                continue
-
-            # Step 1. Extract nucleotide sequence of each gene and filter against min_seq_length
-            gene = GeneFeature(rec, feature)
-            if (
-                gene.seq_obj is None
-                or len(gene.seq_obj) < self.min_seq_length
-                or self._is_region_excluded(gene.feat_name)
-            ):
-                continue
-
-            # Step 2. Translate nucleotide sequence to protein
-            if protein_dict is not None:
-                protein = ProteinFeature(gene=gene)
-                if protein.seq_obj is None:
-                    continue
-                protein_dict.add_feature(protein)
-
-            nuc_dict.add_feature(gene)
-
-    def _extract_rna(self, rec: SeqRecord, nuc_dict: PlastidDict):
-        """
-        Extracts annotated tRNA and rRNA sequences without reading-frame checks or translation.
-        """
-        for feature in RecordFeatures(rec, self.exclude_cds).rna_feats:
-            if (feature.type == "tRNA" and self.include_trna) or (
-                feature.type == "rRNA" and self.include_rrna
-            ):
+        record_features = RecordFeatures(rec, self.exclude_cds)
+        for feature in self._iter_features(
+            rec, record_features.cds_feats, "feature:cds"
+        ):
+            try:
                 if len(feature.location) < self.min_seq_length:
                     continue
                 feat_name = PlastidFeature.name_cleaner.get_safe_gene(feature)
                 if self._is_region_excluded(feat_name):
                     continue
 
-                feat = PlastidFeature(rec, feature)
-                if feat.seq_obj is None:
-                    nuc_dict.add_feature(feat)
-                    continue
-                if len(feat.seq_obj) < self.min_seq_length or self._is_region_excluded(
-                    feat.feat_name
+                # Step 1. Extract nucleotide sequence of each gene and filter against min_seq_length
+                gene = GeneFeature(rec, feature)
+                if (
+                    gene.seq_obj is None
+                    or len(gene.seq_obj) < self.min_seq_length
+                    or self._is_region_excluded(gene.feat_name)
                 ):
+                    if gene.seq_obj is None:
+                        self._note_rejected(rec, "feature:cds", feature, gene)
                     continue
 
-                nuc_dict.add_feature(feat)
+                # Step 2. Translate nucleotide sequence to protein
+                if protein_dict is not None:
+                    protein = ProteinFeature(gene=gene)
+                    if protein.seq_obj is None:
+                        self._note_rejected(rec, "feature:cds", feature, protein)
+                        continue
+                    protein_dict.add_feature(protein)
+
+                nuc_dict.add_feature(gene)
+            except Exception as exc:
+                self._skip_feature(rec, "feature:cds", feature, exc)
+        self._drain_problems(rec, record_features, "feature:cds")
+
+    def _extract_rna(self, rec: SeqRecord, nuc_dict: PlastidDict):
+        """
+        Extracts annotated tRNA and rRNA sequences without reading-frame checks or translation.
+        """
+        record_features = RecordFeatures(rec, self.exclude_cds)
+        for feature in self._iter_features(
+            rec, record_features.rna_feats, "feature:rna"
+        ):
+            try:
+                if (feature.type == "tRNA" and self.include_trna) or (
+                    feature.type == "rRNA" and self.include_rrna
+                ):
+                    if len(feature.location) < self.min_seq_length:
+                        continue
+                    feat_name = PlastidFeature.name_cleaner.get_safe_gene(feature)
+                    if self._is_region_excluded(feat_name):
+                        continue
+
+                    feat = PlastidFeature(rec, feature)
+                    if feat.seq_obj is None:
+                        self._note_rejected(rec, "feature:rna", feature, feat)
+                        nuc_dict.add_feature(feat)
+                        continue
+                    if len(
+                        feat.seq_obj
+                    ) < self.min_seq_length or self._is_region_excluded(feat.feat_name):
+                        continue
+
+                    nuc_dict.add_feature(feat)
+            except Exception as exc:
+                self._skip_feature(rec, "feature:rna", feature, exc)
+        self._drain_problems(rec, record_features, "feature:rna")
 
     def _extract_igs(self, rec: SeqRecord, nuc_dict: PlastidDict):
         """
         Extracts all IGS (intergenic spacers) from a given sequence record
         """
-        all_genes = RecordFeatures(rec, self.exclude_cds).igs_feats
+        record_features = RecordFeatures(rec, self.exclude_cds)
+        all_genes = self._iter_features(rec, record_features.igs_feats, "feature:igs")
         try:
             subsequent_feat = next(all_genes)
         except StopIteration:
+            self._drain_problems(rec, record_features, "feature:igs")
+            return
+        except Exception as exc:
+            self._skip_feature(rec, "feature:igs", "intergenic intervals", exc)
+            self._drain_problems(rec, record_features, "feature:igs")
             return
         # Step 1. Loop through genes
         for feature in all_genes:
             current_feat = subsequent_feat
             subsequent_feat = feature
+            try:
+                # Early pre-checks before constructing IntergenicFeature
+                curr_name = PlastidFeature.name_cleaner.get_safe_gene(current_feat)
+                sub_name = PlastidFeature.name_cleaner.get_safe_gene(subsequent_feat)
+                if curr_name and sub_name:
+                    igs_name = f"{curr_name}_{sub_name}"
+                    inv_name = f"{sub_name}_{curr_name}"
+                    if self._is_region_excluded(igs_name, inv_name):
+                        continue
 
-            # Early pre-checks before constructing IntergenicFeature
-            curr_name = PlastidFeature.name_cleaner.get_safe_gene(current_feat)
-            sub_name = PlastidFeature.name_cleaner.get_safe_gene(subsequent_feat)
-            if curr_name and sub_name:
-                igs_name = f"{curr_name}_{sub_name}"
-                inv_name = f"{sub_name}_{curr_name}"
-                if self._is_region_excluded(igs_name, inv_name):
+                start_pos = int(current_feat.location.end)
+                end_pos = int(subsequent_feat.location.start)
+                if start_pos < end_pos and (end_pos - start_pos) < self.min_seq_length:
                     continue
 
-            start_pos = int(current_feat.location.end)
-            end_pos = int(subsequent_feat.location.start)
-            if start_pos < end_pos and (end_pos - start_pos) < self.min_seq_length:
-                continue
+                # Step 2. Make IGS SeqFeature
+                igs = IntergenicFeature(rec, current_feat, subsequent_feat)
+                if igs.seq_obj is None:
+                    self._note_rejected(rec, "feature:igs", feature, igs)
+                    nuc_dict.add_feature(igs)
+                    continue
+                if len(igs.seq_obj) < self.min_seq_length:
+                    continue
+                if self._is_region_excluded(
+                    igs.feat_name, getattr(igs, "inv_feat_name", None)
+                ):
+                    continue
 
-            # Step 2. Make IGS SeqFeature
-            igs = IntergenicFeature(rec, current_feat, subsequent_feat)
-            if igs.seq_obj is None:
+                # Step 3. Attach IGS to growing dictionary
                 nuc_dict.add_feature(igs)
-                continue
-            if len(igs.seq_obj) < self.min_seq_length:
-                continue
-            if self._is_region_excluded(
-                igs.feat_name, getattr(igs, "inv_feat_name", None)
-            ):
-                continue
-
-            # Step 3. Attach IGS to growing dictionary
-            nuc_dict.add_feature(igs)
+            except Exception as exc:
+                self._skip_feature(rec, "feature:igs", feature, exc)
+        self._drain_problems(rec, record_features, "feature:igs")
 
     def _extract_int(self, rec: SeqRecord, nuc_dict: PlastidDict):
         """
@@ -408,6 +895,7 @@ class ExtractAndCollect:
 
             intron = IntronFeature(rec, feature_obj, offset)
             if intron.seq_obj is None:
+                self._note_rejected(rec, "feature:int", feature_obj, intron)
                 nuc_dict.add_feature(intron)
                 return
             if len(intron.seq_obj) < self.min_seq_length or self._is_region_excluded(
@@ -416,18 +904,39 @@ class ExtractAndCollect:
                 return
             nuc_dict.add_feature(intron)
 
-        for feature in RecordFeatures(rec, self.exclude_cds).int_feats:
+        record_features = RecordFeatures(rec, self.exclude_cds)
+        for feature in self._iter_features(
+            rec, record_features.int_feats, "feature:int"
+        ):
+            try:
+                n_parts = len(feature.location.parts)
+            except Exception as exc:
+                self._skip_feature(rec, "feature:int", feature, exc)
+                continue
             # Step 1.a. If one intron in gene:
-            if len(feature.location.parts) == 2:
-                _add_intron(feature, 0)
-
+            if n_parts == 2:
+                try:
+                    _add_intron(feature, 0)
+                except Exception as exc:
+                    self._skip_feature(rec, "feature:int", feature, exc)
             # Step 1.b. If two introns in gene:
-            elif len(feature.location.parts) == 3:
-                feature_copy = deepcopy(
-                    feature
-                )  # Important b/c feature is overwritten in extract_internal_intron()
-                _add_intron(feature, 0)
-                _add_intron(feature_copy, 1)
+            elif n_parts == 3:
+                try:
+                    feature_copy = deepcopy(
+                        feature
+                    )  # Important b/c feature is overwritten in extract_internal_intron()
+                except Exception as exc:
+                    self._skip_feature(rec, "feature:int", feature, exc)
+                    continue
+                try:
+                    _add_intron(feature, 0)
+                except Exception as exc:
+                    self._skip_feature(rec, "feature:int", feature, exc)
+                try:
+                    _add_intron(feature_copy, 1)
+                except Exception as exc:
+                    self._skip_feature(rec, "feature:int", feature, exc)
+        self._drain_problems(rec, record_features, "feature:int")
 
 
 class RecordFeatures:
@@ -443,6 +952,20 @@ class RecordFeatures:
         self._features = record.features
         self.rec_name = record.name
         self.exclude_set = set(exclude_list) if exclude_list else set()
+        self._problems: list[tuple[str, str]] = []
+
+    def _keep(self, feature: SeqFeature, allowed: tuple[str, ...] | str) -> bool:
+        try:
+            if isinstance(allowed, str):
+                type_ok = feature.type == allowed
+            else:
+                type_ok = feature.type in allowed
+            return bool(type_ok and self._not_exclude(feature))
+        except Exception as exc:
+            self._problems.append(
+                (_feature_label(feature), f"{type(exc).__name__}: {exc}")
+            )
+            return False
 
     @property
     def cds_feats(self) -> Generator[SeqFeature, None, None]:
@@ -450,7 +973,7 @@ class RecordFeatures:
         A generator of CDS features in the record.
         """
         for f in self._features:
-            if f.type == "CDS" and self._not_exclude(f):
+            if self._keep(f, "CDS"):
                 yield f
 
     @property
@@ -459,7 +982,7 @@ class RecordFeatures:
         A generator of tRNA and rRNA features in the record.
         """
         for f in self._features:
-            if f.type in ("tRNA", "rRNA") and self._not_exclude(f):
+            if self._keep(f, ("tRNA", "rRNA")):
                 yield f
 
     @property
@@ -468,26 +991,38 @@ class RecordFeatures:
         A generator of IGS features in the record.
         """
         # Note: No need to include "if feature.type=='tRNA'", because all tRNAs are also annotated as genes
-        features = [
-            f for f in self._features if f.type == "gene" and self._not_exclude(f)
-        ]
-        # Handle spliced exons
+        features = [f for f in self._features if self._keep(f, "gene")]
+        # Handle spliced exons. A bad location used to abort every gene of the
+        # genome; the genes that can still be walked are yielded instead.
         handler = ExonSpliceHandler(features, self.rec_name)
-        handler.resolve()
+        try:
+            handler.resolve()
+        except Exception as exc:
+            self._problems.append(
+                ("compound locations", f"{type(exc).__name__}: {exc}")
+            )
         yield from features
 
     @property
     def int_feats(self) -> Generator[SeqFeature, None, None]:
         """
-        A generator of IGS features in the record.
+        A generator of intron-bearing CDS and tRNA features in the record.
         """
         for f in self._features:
-            if (f.type == "CDS" or f.type == "tRNA") and self._not_exclude(f):
+            if self._keep(f, ("CDS", "tRNA")):
                 yield f
 
     def _not_exclude(self, feature: SeqFeature) -> bool:
-        gene = PlastidFeature.name_cleaner.get_safe_gene(feature)
-        return gene and gene not in self.exclude_set and "orf" not in gene
+        try:
+            gene = PlastidFeature.name_cleaner.get_safe_gene(feature)
+            if not gene or not isinstance(gene, str):
+                return False
+            return gene not in self.exclude_set and "orf" not in gene
+        except Exception as exc:
+            self._problems.append(
+                (_feature_label(feature), f"{type(exc).__name__}: {exc}")
+            )
+            return False
 
 
 # -----------------------------------------------------------------#

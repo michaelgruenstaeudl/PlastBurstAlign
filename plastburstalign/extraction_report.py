@@ -212,6 +212,17 @@ class ExtractionReport:
             )
         return "\n".join(lines)
 
+    def add_unlisted_feature_failures(self, stage: str, count: int) -> None:
+        """Count feature failures that are not stored individually.
+
+        The scanner can skip more features than it keeps descriptions for.
+        Those still have to move ``features_skipped`` and ``stage_counts``.
+        """
+        if count <= 0:
+            return
+        self.features_skipped += count
+        self.stage_counts[stage] = self.stage_counts.get(stage, 0) + count
+
     def to_dict(self) -> dict[str, Any]:
         """JSON-serialisable form (for the run manifest)."""
         return {
@@ -240,3 +251,18 @@ class ExtractionReport:
                 for f in self.feature_failures
             ],
         }
+
+
+class ExtractionError(RuntimeError):
+    """No input file yielded a usable region.
+
+    The run report is attached so callers can see which files failed and why
+    without parsing the message.
+
+    Attributes:
+        report: The :class:`ExtractionReport` for the run (possibly partial).
+    """
+
+    def __init__(self, message: str, report: ExtractionReport | None = None) -> None:
+        super().__init__(message)
+        self.report = report if report is not None else ExtractionReport()

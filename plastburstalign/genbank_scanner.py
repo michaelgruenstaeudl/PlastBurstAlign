@@ -98,6 +98,16 @@ def _describe(source: str | PathLike | TextIO) -> str:
     return str(getattr(source, "name", "<stream>"))
 
 
+def _has_genbank_section(text: str, keyword: str) -> bool:
+    """True when a record line begins with ``keyword`` (``FEATURES``, ``ORIGIN``)."""
+    for line in text.splitlines():
+        if line.startswith(keyword) and (
+            len(line) == len(keyword) or line[len(keyword)] in " \t"
+        ):
+            return True
+    return False
+
+
 def _short(exc: BaseException, limit: int = 160) -> str:
     text = " ".join(f"{type(exc).__name__}: {exc}".split())
     return text if len(text) <= limit else text[: limit - 3] + "..."
@@ -158,9 +168,20 @@ def fast_read_genbank(
             except Exception:
                 pass
         try:
-            return SeqIO.read(source, "genbank")
+            record = SeqIO.read(source, "genbank")
         except Exception as exc:
             bio_exc = exc
+        else:
+            # BioPython accepts a sequence-only record, so a flatfile whose
+            # feature table was deleted still parses. A plastome with no
+            # FEATURES or ORIGIN section is not usable (module docstring);
+            # keep the fast path's rejection instead of that fallback.
+            if not _has_genbank_section(text, "FEATURES") or not _has_genbank_section(
+                text, "ORIGIN"
+            ):
+                bio_exc = ValueError("Missing FEATURES or ORIGIN section")
+            else:
+                return record
 
     # Both parsers failed: keep whatever can be read, feature by feature.
     try:
