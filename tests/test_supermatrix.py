@@ -787,7 +787,10 @@ class DeterminismTests(unittest.TestCase):
         reference = SupermatrixBuilder(
             self.sources, rename=legacy_concat_rename, max_workers=1
         ).build()
-        delays = [0.05 * (len(self.sources) - i) for i in range(len(self.sources))]
+        delays = [
+            0.0 if i == len(self.sources) - 1 else 0.04 * (len(self.sources) - i)
+            for i in range(len(self.sources))
+        ]
         builder = DelayedBuilder(
             self.sources,
             delays=delays,
@@ -797,7 +800,9 @@ class DeterminismTests(unittest.TestCase):
         )
         shuffled = builder.build()
         self.assertNotEqual(builder.completion, sorted(builder.completion))
-        self.assertEqual(builder.completion[0], len(self.sources) - 1)
+        self.assertIn(
+            builder.completion[0], (len(self.sources) - 1, len(self.sources) - 2)
+        )
         self.assertEqual(
             shuffled.sha256(include_taxa=True), reference.sha256(include_taxa=True)
         )

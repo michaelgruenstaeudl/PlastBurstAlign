@@ -1352,7 +1352,7 @@ def _detect_storage(ctx: _Ctx) -> tuple[StorageTier, ...]:
     for cand in _STANDARD_SCRATCH_CANDIDATES:
         if ctx.isdir(cand) or cand in mount_points:
             add(cand, "candidate")
-    if not paths and ctx.system in {"Windows", "Darwin"}:
+    if not paths and ctx.is_live and ctx.system in {"Windows", "Darwin"}:
         import tempfile
 
         add(tempfile.gettempdir(), "tempdir")
