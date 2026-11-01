@@ -176,7 +176,9 @@ class TimeModel:
     calibrated: bool = False
     provenance: str = (
         "PROVISIONAL analytic placeholders (45 s @ 8 threads at each tier edge); "
-        "not measured"
+        "2026-11-01 reduced-grid ACCURATE kappa (seconds/W @8t) spanned ~3e-10..1e-7 "
+        "(median ~1.2e-8) vs sec_per_work[0]=5e-9 — not trusted enough to calibrate; "
+        "see docs/calibration.md"
     )
     sec_per_work: tuple[float, float, float, float] = (5.0e-9, 1.5e-9, 7.0e-10, 3.0e-10)
     serial_fraction: tuple[float, float, float, float] = (0.20, 0.35, 0.35, 0.45)

@@ -72,6 +72,13 @@ class PackageMetaTests(unittest.TestCase):
             "MAFFT",
             "ClustalOmega",
             "MUSCLE",
+            "align",
+            "autotune",
+            "estimate",
+            "AlignmentResult",
+            "TuningPlan",
+            "HostProfile",
+            "detect_host",
         ):
             self.assertIn(name, plastburstalign.__all__)
             self.assertTrue(hasattr(plastburstalign, name))

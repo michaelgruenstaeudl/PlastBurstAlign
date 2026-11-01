@@ -215,8 +215,6 @@ class TestClusterPipelineEndToEnd(unittest.TestCase):
             "matK": {"taxon1": "ATGAAATAA", "taxon2": "ATGAAATAG"},
             "rbcL": {"taxon1": "ATGTTTTAA", "taxon2": "ATGTTTTAG"},
         }
-        for r, seqs in regions.items():
-            self._create_mock_unaligned(r, seqs)
 
         mock_plastid_data = MagicMock()
         mock_plastid_data.order = "alpha"
@@ -224,6 +222,15 @@ class TestClusterPipelineEndToEnd(unittest.TestCase):
         mock_plastid_data.order_map = {"atpA": 0, "matK": 1, "rbcL": 2}
         mock_plastid_data.nucleotides = {r: None for r in regions}
         mock_plastid_data.store.get_region_summary.return_value = {}
+
+        def mock_export_fasta(region: str, seq_type: str, path: str) -> None:
+            seqs = regions[region]
+            os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as handle:
+                for header, seq in seqs.items():
+                    handle.write(f">{header}\n{seq}\n")
+
+        mock_plastid_data.store.export_fasta.side_effect = mock_export_fasta
 
         # Stage 1: Export
         export_params = UserParameters(
@@ -247,6 +254,11 @@ class TestClusterPipelineEndToEnd(unittest.TestCase):
             pba_export = PlastBurstAlign(export_params)
             pba_export.execute()
 
+        # Fresh runs clear stale unaligned FASTA; recreate after export for workers
+        # that still prefer shared out_dir copies when present.
+        for r, seqs in regions.items():
+            self._create_mock_unaligned(r, seqs)
+
         manifest_path = os.path.join(self.work_dir, "slurm_manifest.json")
         self.assertTrue(os.path.exists(manifest_path))
         manifest = ClusterPartitionEngine.load_manifest(manifest_path)
@@ -259,6 +271,7 @@ class TestClusterPipelineEndToEnd(unittest.TestCase):
                 open(out_fn, "w", encoding="utf-8") as dst,
             ):
                 dst.write(src.read())
+            return True
 
         for p_id in range(manifest.num_partitions):
             worker_params = UserParameters(

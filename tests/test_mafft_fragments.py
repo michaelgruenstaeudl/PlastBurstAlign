@@ -114,9 +114,11 @@ class FragmentPathTests(unittest.TestCase):
         commands: list[list[str]] = []
         original = MAFFT._run_to_file
 
-        def recording(self_: MAFFT, cmd: list[str], output_file: str) -> bool:
+        def recording(
+            self_: MAFFT, cmd: list[str], output_file: str, env=None, **kwargs
+        ) -> bool:
             commands.append(list(cmd))
-            return original(self_, cmd, output_file)
+            return original(self_, cmd, output_file, env=env, **kwargs)
 
         with patch.object(MAFFT, "_run_to_file", recording):
             self.assertTrue(mafft.align(src, self.path("out.fa"), threads=3))
@@ -142,9 +144,11 @@ class FragmentPathTests(unittest.TestCase):
         commands: list[list[str]] = []
         original = MAFFT._run_to_file
 
-        def recording(self_: MAFFT, cmd: list[str], output_file: str) -> bool:
+        def recording(
+            self_: MAFFT, cmd: list[str], output_file: str, env=None, **kwargs
+        ) -> bool:
             commands.append(list(cmd))
-            return original(self_, cmd, output_file)
+            return original(self_, cmd, output_file, env=env, **kwargs)
 
         with patch.object(MAFFT, "_run_to_file", recording):
             self.assertTrue(mafft.align(src, out, threads=1))
@@ -172,9 +176,11 @@ class FragmentPathTests(unittest.TestCase):
         commands: list[list[str]] = []
         original = MAFFT._run_to_file
 
-        def recording(self_: MAFFT, cmd: list[str], output_file: str) -> bool:
+        def recording(
+            self_: MAFFT, cmd: list[str], output_file: str, env=None, **kwargs
+        ) -> bool:
             commands.append(list(cmd))
-            return original(self_, cmd, output_file)
+            return original(self_, cmd, output_file, env=env, **kwargs)
 
         with patch.object(MAFFT, "_run_to_file", recording):
             self.assertTrue(self.aligner().align(src, self.path("out.fa")))

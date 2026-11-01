@@ -60,6 +60,19 @@ class UserParameters(Dict[str, Any]):
         manifest_path: Optional[str] = None,
         individual_nexus: bool = True,
         scratch_dir: Optional[str] = None,
+        keep_unaligned: bool = True,
+        subdivide: str = "auto",
+        trim: Optional[str] = None,
+        min_occupancy: Optional[float] = None,
+        partitions: str = "raxml,nexus",
+        codon_partitions: bool = False,
+        smt: Optional[bool] = None,
+        memory_limit: Optional[str] = None,
+        seed: Optional[int] = None,
+        phylip: bool = False,
+        time_budget: Optional[str] = None,
+        dashboard: Optional[bool] = None,
+        estimate: bool = False,
     ):
         """
         A dictionary that validates user parameters that are to be used within the package.
@@ -123,6 +136,21 @@ class UserParameters(Dict[str, Any]):
         self["manifest_path"] = manifest_path
         self._set_individual_nexus(individual_nexus)
         self._set_scratch_dir(scratch_dir)
+        self._set_keep_unaligned(keep_unaligned)
+        self._set_subdivide(subdivide)
+        self["trim"] = trim
+        self["min_occupancy"] = (
+            float(min_occupancy) if min_occupancy is not None else None
+        )
+        self["partitions"] = partitions
+        self["codon_partitions"] = bool(codon_partitions)
+        self["smt"] = smt
+        self["memory_limit"] = memory_limit
+        self["seed"] = int(seed) if seed is not None else None
+        self["phylip"] = bool(phylip)
+        self["time_budget"] = str(time_budget) if time_budget is not None else None
+        self["dashboard"] = dashboard
+        self["estimate"] = bool(estimate)
 
     def _set_select_mode(self, select_mode: str):
         try:
@@ -211,6 +239,8 @@ class UserParameters(Dict[str, Any]):
         self["min_num_taxa"] = min_num_taxa
 
     def _set_num_threads(self, num_threads: Union[str, int]):
+        # Preserve the request for TuningPlan (``"auto"`` -> physical cpu_budget).
+        self["num_threads_requested"] = num_threads
         resolved: Any = num_threads
         if isinstance(num_threads, str):
             num_threads_clean = num_threads.strip().lower()
@@ -300,6 +330,17 @@ class UserParameters(Dict[str, Any]):
             self._test_type("scratch_dir", scratch_dir, str)
         self["scratch_dir"] = scratch_dir
 
+    def _set_keep_unaligned(self, keep_unaligned: bool):
+        self._test_type("keep_unaligned", keep_unaligned, bool)
+        self["keep_unaligned"] = keep_unaligned
+
+    def _set_subdivide(self, subdivide: str):
+        token = str(subdivide or "auto").strip().lower()
+        if token not in {"auto", "off", "force"}:
+            log.critical(f"Invalid `subdivide` value provided: {subdivide}")
+            raise ValueError
+        self["subdivide"] = token
+
 
 class UserParametersScript(UserParameters):
     _construct_name_map: Dict[str, str] = {
@@ -346,6 +387,19 @@ class UserParametersScript(UserParameters):
         "individualnexus": "individual_nexus",
         "scratch_dir": "scratch_dir",
         "scratchdir": "scratch_dir",
+        "keep_unaligned": "keep_unaligned",
+        "subdivide": "subdivide",
+        "trim": "trim",
+        "min_occupancy": "min_occupancy",
+        "partitions": "partitions",
+        "codon_partitions": "codon_partitions",
+        "smt": "smt",
+        "memory_limit": "memory_limit",
+        "seed": "seed",
+        "phylip": "phylip",
+        "time_budget": "time_budget",
+        "dashboard": "dashboard",
+        "estimate": "estimate",
     }
 
     def __init__(self):
@@ -360,7 +414,8 @@ class UserParametersScript(UserParameters):
         if hasattr(args, "config") and args.config:
             config_params = self._load_config_file(args.config)
 
-        # Merge command line args with config file, command line takes precedence
+        # Merge command line args with config file, command line takes precedence.
+        # ``--doctor`` / ``--version`` are handled in ``__main__`` before this runs.
         args_dict = self._get_construct_dict(args)
         merged_params = {**config_params, **args_dict}
 
@@ -629,14 +684,122 @@ class UserParametersScript(UserParameters):
             default=True,
             help="Write individual NEXUS alignment files for each region (default: true; disable to minimize I/O)",
         )
+        parser.add_argument(
+            "--keep-unaligned",
+            dest="keep_unaligned",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help="Keep unaligned FASTA files in out_dir (default: true)",
+        )
+        parser.add_argument(
+            "--subdivide",
+            choices=("auto", "off", "force"),
+            default="auto",
+            help="Sub-locus chunking for long MAFFT loci (default: auto)",
+        )
+        parser.add_argument(
+            "--trim",
+            type=str,
+            default=None,
+            help="Site trim spec (none, occupancy=<f>, entropy, informative-only, gappyout)",
+        )
+        parser.add_argument(
+            "--min-occupancy",
+            dest="min_occupancy",
+            type=float,
+            default=None,
+            help="Minimum column occupancy when trimming (adds occupancy=<f>)",
+        )
+        parser.add_argument(
+            "--partitions",
+            type=str,
+            default="raxml,nexus",
+            help="Comma-separated partition formats: raxml,nexus,iqtree,partitionfinder,none",
+        )
+        parser.add_argument(
+            "--codon-partitions",
+            dest="codon_partitions",
+            action=argparse.BooleanOptionalAction,
+            default=False,
+            help="Emit codon-position partitions for CDS (default: false)",
+        )
+        parser.add_argument(
+            "--smt",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help="Include SMT siblings in the CPU budget (default: host-tuned)",
+        )
+        parser.add_argument(
+            "--memory-limit",
+            dest="memory_limit",
+            type=str,
+            default=None,
+            help="Memory admission cap (e.g. 8G)",
+        )
+        parser.add_argument(
+            "--seed",
+            type=int,
+            default=None,
+            help="MAFFT --randomseed value for deterministic runs",
+        )
+        parser.add_argument(
+            "--phylip",
+            action=argparse.BooleanOptionalAction,
+            default=False,
+            help="Also write a relaxed PHYLIP concatenated alignment (default: false)",
+        )
+        parser.add_argument(
+            "--doctor",
+            action="store_true",
+            default=False,
+            help="Diagnose host, aligners and scratch; exit without aligning",
+        )
+        parser.add_argument(
+            "--version",
+            action="store_true",
+            default=False,
+            help="Print version and exit",
+        )
+        parser.add_argument(
+            "--estimate",
+            action="store_true",
+            default=False,
+            help="Print a pre-flight cost estimate after extract/clean and exit",
+        )
+        parser.add_argument(
+            "--dashboard",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help="Enable or disable the rich live dashboard (default: auto)",
+        )
+        parser.add_argument(
+            "--time-budget",
+            dest="time_budget",
+            type=str,
+            default=None,
+            help=(
+                "Opt-in non-reproducible host-adaptive time budget "
+                "(e.g. 2h); currently recorded with a warning only"
+            ),
+        )
         return parser
 
     @classmethod
     def _get_construct_dict(cls, args: argparse.Namespace) -> Dict[str, Any]:
         # map the cmd argument names to class constructor parameters,
         # and remove empty argument values (`None`)
+        skip = {"doctor", "version"}
         args_dict = vars(args)
         args_dict = {
-            cls._construct_name_map[k]: v for k, v in args_dict.items() if v is not None
+            cls._construct_name_map[k]: v
+            for k, v in args_dict.items()
+            if v is not None and k not in skip and k in cls._construct_name_map
         }
+        # BooleanOptionalAction leaves False intact; keep estimate/dashboard
+        # when explicitly False so --no-dashboard is honoured.
+        raw = vars(args)
+        if "estimate" in raw and raw["estimate"]:
+            args_dict["estimate"] = True
+        if "dashboard" in raw and raw["dashboard"] is not None:
+            args_dict["dashboard"] = bool(raw["dashboard"])
         return args_dict

@@ -136,11 +136,16 @@ class StrategyConstants:
     # --- provenance -------------------------------------------------------
     calibrated: bool = False
     source: str = (
-        "provisional: analytic, conservative (prefers --auto); see module docstring"
+        "provisional: analytic, conservative (prefers --auto); 2026-11-01 reduced "
+        "grid on Ryzen 5650U supported keeping these numbers (naive --fit rejected; "
+        "see docs/calibration.md)"
     )
-    mafft_version: str = "v7.526 (2024/Apr/26) [reference, not measured]"
-    cpu: str = "n/a"
-    date: str = "2026-10-30"
+    mafft_version: str = "v7.526 (2024/Apr/26)"
+    cpu: str = (
+        "AMD Ryzen 5 PRO 5650U with Radeon Graphics (12 logical cpus); "
+        "reduced-grid check only, calibrated=False"
+    )
+    date: str = "2026-11-01"
     target_seconds: float = 45.0
     target_threads: int = 8
 

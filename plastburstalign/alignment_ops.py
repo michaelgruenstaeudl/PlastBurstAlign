@@ -5,30 +5,40 @@ import os
 import shutil
 import tempfile
 import threading
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from Bio import AlignIO, SeqIO
 from Bio.Align import MultipleSeqAlignment
 from Bio.Data.CodonTable import ambiguous_generic_by_id
-from Bio.Nexus.Nexus import Nexus as NexusAlignment
 from Bio.Seq import MutableSeq, Seq
 from Bio.SeqRecord import SeqRecord
 
-from .alignment_tools import AlignmentTool, get_alignment_tool
+from .align_runtime import (
+    attach_shared_scratch,
+    parse_partitions_flag,
+    pin_algorithm_args,
+    resolve_tuning_plan,
+    strategy_for_locus,
+    trim_spec_from_params,
+    unaligned_bytes_estimate,
+    want_subdivide,
+    water_fill_preferences,
+    work_for_locus,
+)
+from .alignment_tools import MAFFT, AlignmentTool, get_alignment_tool
+from .autotune import TuningPlan
+from .chunking import ChunkConfig, plan_chunks_with_reason, splice_alignments
+from .ephemeral_engine import ScratchEngine
+from .events import ProgressSink
 from .helpers import bounded_submit_iterator, resolve_scratch_dir, split_list
 from .logging_ops import logger as log
-from .nexus_ops import (
-    ConcatenationError,
-    IncrementalNexusAccumulator,
-    fast_write_fasta,
-    fast_write_nexus,
-    fast_write_nexus_partitions,
-    fast_write_raxml_partitions,
-)
+from .nexus_ops import ConcatenationError
+from .scheduler import FanOut, LocusScheduler, SchedTask, SchedulerReport, TaskContext
 from .seqfeature_ops import PlastidData
-from .task_queue import CoreBudgetPool
+from .strategy import AlignmentStrategy, estimate_work
+from .supermatrix import LocusSource, SupermatrixBuilder, legacy_concat_rename
 
 # ===================================================================
 # Module-level helper functions for multiprocessing
@@ -129,6 +139,11 @@ class AlignmentCoordination:
         self._success_lock = threading.Lock()
         self._scratch_lock = threading.Lock()
         self._scratch_dir: str | None = None
+        self._plan: TuningPlan | None = None
+        self._scheduler_report: SchedulerReport | None = None
+        self._locus_records: list[dict[str, Any]] = []
+        self._supermatrix_info: dict[str, Any] | None = None
+        self.sink: ProgressSink | None = user_params.get("progress_sink")
 
         # Create the appropriate alignment tool
         tool_name = (user_params or {}).get("alignment_tool", "mafft") or "mafft"
@@ -142,10 +157,18 @@ class AlignmentCoordination:
             raise RuntimeError("No alignment tool could be initialized")
         self.aligner: AlignmentTool = aligner
 
+        custom_scratch = user_params.get("scratch_dir") if user_params else None
+        self._scratch = ScratchEngine(custom_scratch)
+        attach_shared_scratch(self.aligner, self._scratch)
+
     @property
     def _out_dir(self) -> str:
         """The output directory (a required user parameter)."""
         return str(self.user_params["out_dir"])
+
+    @property
+    def keep_unaligned(self) -> bool:
+        return bool(self.user_params.get("keep_unaligned", True))
 
     @property
     def mode(self):
@@ -158,6 +181,20 @@ class AlignmentCoordination:
         ):
             return self.plastid_data.mode
         return self.user_params.get("select_mode")
+
+    def scratch_stats(self) -> dict[str, Any] | None:
+        """Scratch accounting for the run manifest (``None`` if engine closed)."""
+        try:
+            return self._scratch.stats().as_dict()
+        except Exception:
+            return None
+
+    def close_scratch(self) -> None:
+        """Release the shared scratch engine (idempotent)."""
+        try:
+            self._scratch.cleanup()
+        except Exception as exc:
+            log.debug(f"scratch cleanup: {exc}")
 
     def _aligner_supports_param(self, param_name: str) -> bool:
         """Determines if the configured aligner accepts the given keyword parameter."""
@@ -172,6 +209,9 @@ class AlignmentCoordination:
 
     def save_unaligned(self):
         """Saves unaligned nucleotide and protein matrices in parallel."""
+        if not self.keep_unaligned:
+            self._unaligned_saved = True
+            return
         log.info("saving individual regions as unaligned matrices in parallel")
         collect_proteins = self.plastid_data.mode.collects_proteins()
         out_dir = self._out_dir
@@ -226,7 +266,17 @@ class AlignmentCoordination:
     # Shared helpers for the monolithic and the Slurm-worker alignment paths
     # ------------------------------------------------------------------
 
-    _ALIGNER_OPTIONAL_PARAMS = ("threads", "sequence_count", "max_len", "min_len")
+    _ALIGNER_OPTIONAL_PARAMS = (
+        "threads",
+        "sequence_count",
+        "max_len",
+        "min_len",
+        "alphabet",
+        "algorithm_args",
+        "cpu_ids",
+        "env",
+        "pin",
+    )
 
     def _resolve_num_workers(self) -> int:
         raw_threads = self.user_params.get("num_threads", 1)
@@ -251,32 +301,64 @@ class AlignmentCoordination:
             return {}
         return summary if isinstance(summary, dict) else {}
 
-    @staticmethod
+    def _ensure_plan(
+        self, region_summary: Mapping[str, Mapping[str, int]], *, alphabet: str
+    ) -> TuningPlan:
+        if self._plan is not None:
+            return self._plan
+        plan = resolve_tuning_plan(self.user_params, region_summary, alphabet=alphabet)
+        self._plan = plan
+        self.user_params["num_threads"] = plan.cpu_budget
+        for warning in plan.warnings:
+            log.warning(warning)
+        log.info(plan.explain())
+        return plan
+
     def _build_align_kwargs(
+        self,
         summary_entry: Mapping[str, int],
         leased_threads: int,
         support: Mapping[str, bool],
+        *,
+        alphabet: str | None = None,
+        algorithm_args: Sequence[str] | None = None,
+        cpu_ids: Sequence[int] | None = None,
+        env: Mapping[str, str] | None = None,
+        pin: bool = False,
     ) -> dict[str, Any]:
         """Dynamically passes only the arguments the aligner accepts."""
         align_kwargs: dict[str, Any] = {}
-        if support["threads"]:
+        if support.get("threads"):
             align_kwargs["threads"] = leased_threads
         seq_count = summary_entry.get("count")
-        if support["sequence_count"] and seq_count is not None:
+        if support.get("sequence_count") and seq_count is not None:
             align_kwargs["sequence_count"] = seq_count
             max_len = summary_entry.get("max_len")
-            if support["max_len"] and max_len is not None:
+            if support.get("max_len") and max_len is not None:
                 align_kwargs["max_len"] = max_len
             min_len = summary_entry.get("min_len")
-            if support["min_len"] and min_len is not None:
+            if support.get("min_len") and min_len is not None:
                 align_kwargs["min_len"] = min_len
+        if alphabet is not None and support.get("alphabet"):
+            align_kwargs["alphabet"] = alphabet
+        if algorithm_args is not None and support.get("algorithm_args"):
+            align_kwargs["algorithm_args"] = list(algorithm_args)
+        if cpu_ids is not None and support.get("cpu_ids"):
+            align_kwargs["cpu_ids"] = list(cpu_ids)
+        if env is not None and support.get("env"):
+            align_kwargs["env"] = dict(env)
+        if pin and support.get("pin"):
+            align_kwargs["pin"] = True
         return align_kwargs
 
     def _get_worker_scratch(self) -> str:
         """Lazily creates a private scratch directory for exported unaligned FASTA."""
         with self._scratch_lock:
             if self._scratch_dir is None:
-                base = resolve_scratch_dir(self.user_params.get("scratch_dir"))
+                try:
+                    base = str(self._scratch.path)
+                except Exception:
+                    base = resolve_scratch_dir(self.user_params.get("scratch_dir"))
                 self._scratch_dir = tempfile.mkdtemp(prefix="pba_unaligned_", dir=base)
             return self._scratch_dir
 
@@ -286,12 +368,13 @@ class AlignmentCoordination:
         if scratch:
             shutil.rmtree(scratch, ignore_errors=True)
 
-    def _unaligned_fasta(self, region: str, seq_type: str) -> tuple[str, bool]:
-        """Returns the unaligned FASTA of a region, exporting it if it is not on disk.
+    def _unaligned_fasta(
+        self, region: str, seq_type: str, *, scratch_dir: str | None = None
+    ) -> tuple[str, bool]:
+        """Returns the unaligned FASTA of a region, exporting it if needed.
 
-        An existing non-empty `<seq_type>_<region>.unalign.fasta` in `out_dir` is
-        used as is. Otherwise the region is exported from the SQLite store into
-        node-local scratch, so Slurm workers do not need any shared unaligned files.
+        When ``keep_unaligned`` is True, writes/reuses ``out_dir`` files. When
+        False, always exports into scratch and marks the path temporary.
 
         Returns:
             (path, is_temporary); temporary files should be removed after use.
@@ -299,9 +382,13 @@ class AlignmentCoordination:
         shared = os.path.join(self._out_dir, f"{seq_type}_{region}.unalign.fasta")
         if os.path.exists(shared) and os.path.getsize(shared) > 0:
             return shared, False
-        local = os.path.join(
-            self._get_worker_scratch(), f"{seq_type}_{region}.unalign.fasta"
-        )
+        # Durable copies are created by ``save_unaligned`` (monolithic keep path).
+        # Workers and ``keep_unaligned=False`` always export into scratch.
+        if self.keep_unaligned and self._unaligned_saved:
+            self.plastid_data.store.export_fasta(region, seq_type, shared)
+            return shared, False
+        base = scratch_dir or self._get_worker_scratch()
+        local = os.path.join(base, f"{seq_type}_{region}.unalign.fasta")
         self.plastid_data.store.export_fasta(region, seq_type, local)
         return local, True
 
@@ -318,118 +405,337 @@ class AlignmentCoordination:
             return keys
         return [k for k in keys if k in target_regions]
 
-    def _nuc_MSA(self, target_regions: set[str] | None = None):
-        """Aligns nucleotide regions (all of them, or only `target_regions`)."""
-        # Pre-fetch region taxon counts in one O(1) bulk query
-        region_summary = self._get_region_summary("nucl")
-        num_workers = self._resolve_num_workers()
+    def _is_mafft(self) -> bool:
+        if isinstance(self.aligner, MAFFT):
+            return True
+        name = str(self.user_params.get("alignment_tool", "mafft") or "mafft").lower()
+        return name == "mafft"
 
-        log.info(
-            "conducting multiple sequence alignments based on nucleotide sequence"
-            f" data using {num_workers} threads"
+    def _adjust_direction(self) -> bool:
+        cfg = self.user_params.get("alignment_tool_config") or {}
+        return bool(cfg.get("adjustdirection", False))
+
+    def _record_locus(
+        self,
+        region: str,
+        *,
+        alphabet: str,
+        strategy: AlignmentStrategy | None,
+        chunked: bool = False,
+        chunk_reason: str | None = None,
+        ok: bool = True,
+        error: str | None = None,
+    ) -> None:
+        record: dict[str, Any] = {
+            "region": region,
+            "alphabet": alphabet,
+            "ok": ok,
+            "chunked": chunked,
+        }
+        mode = self.user_params.get("select_mode")
+        if mode is not None:
+            record["mode"] = str(getattr(mode, "value", mode))
+        if strategy is not None:
+            record["strategy"] = strategy.to_dict()
+        if chunk_reason:
+            record["chunk_reason"] = chunk_reason
+        if error:
+            record["error"] = error
+        with self._success_lock:
+            self._locus_records.append(record)
+
+    def _run_scheduler(
+        self, tasks: list[SchedTask], plan: TuningPlan
+    ) -> SchedulerReport:
+        scheduler = LocusScheduler(
+            total_cores=plan.cpu_budget,
+            topology=plan.topology,
+            use_smt=plan.use_smt,
+            memory_budget=plan.task_memory_envelope_bytes,
+            scratch=self._scratch,
+            sink=self.sink,
+            pin=plan.pinning,
+            max_workers=plan.workers,
+        )
+        report = scheduler.run(tasks, phase="align")
+        self._scheduler_report = report
+        return report
+
+    def _align_fasta(
+        self,
+        input_file: str,
+        output_file: str,
+        *,
+        summary_entry: Mapping[str, int],
+        support: Mapping[str, bool],
+        ctx: TaskContext,
+        alphabet: str,
+        algorithm_args: Sequence[str] | None = None,
+    ) -> bool:
+        align_kwargs = self._build_align_kwargs(
+            summary_entry,
+            ctx.threads,
+            support,
+            alphabet=alphabet,
+            algorithm_args=algorithm_args,
+            cpu_ids=ctx.cpu_ids,
+            env=ctx.subprocess_env(),
+            pin=ctx.pinning,
+        )
+        return bool(self.aligner.align(input_file, output_file, **align_kwargs))
+
+    def _nuc_locus_task(
+        self,
+        region: str,
+        *,
+        region_summary: Mapping[str, Mapping[str, int]],
+        support: Mapping[str, bool],
+        preferred: int,
+        plan: TuningPlan,
+    ) -> SchedTask:
+        summary_entry = dict(region_summary.get(region, {}))
+        strategy = strategy_for_locus(summary_entry, alphabet="nucl")
+        n_seq = int(summary_entry.get("count", 0) or 0)
+        max_len = int(summary_entry.get("max_len", 0) or 0)
+        work = work_for_locus(summary_entry, alphabet="nucl")
+        bytes_est = unaligned_bytes_estimate(summary_entry)
+        cap = max(1, int(plan.threads_per_task_cap))
+        pref = max(1, min(int(preferred), cap))
+        max_threads = cap if support.get("threads") else 1
+        est_mem = plan.est_mem_bytes(
+            max(1, n_seq),
+            max(1, max_len),
+            parttree=strategy.uses_parttree,
+            alphabet="nucleotide",
+            threads=pref,
+        )
+        subdivide_mode = str(
+            self.user_params.get("subdivide", "auto") or "auto"
+        ).lower()
+
+        def run_locus(ctx: TaskContext) -> Any:
+            fasta_dir = os.path.join(self._out_dir, "fasta")
+            os.makedirs(fasta_dir, exist_ok=True)
+            out_aligned = os.path.join(fasta_dir, f"nucl_{region}.aligned.fasta")
+            scratch_dir = str(ctx.scratch.path) if ctx.scratch is not None else None
+            unalign, is_temp = self._unaligned_fasta(
+                region, "nucl", scratch_dir=scratch_dir
+            )
+
+            def _cleanup_unalign() -> None:
+                if is_temp:
+                    self._remove_quietly(unalign)
+
+            try_chunks = want_subdivide(
+                mode=subdivide_mode,
+                alphabet="nucl",
+                n_seq=n_seq,
+                max_len=max_len,
+                is_mafft=self._is_mafft(),
+                adjust_direction=self._adjust_direction(),
+                strategy=strategy,
+            )
+            if try_chunks:
+                plan_chunks, reason = plan_chunks_with_reason(
+                    unalign,
+                    "nucl",
+                    ChunkConfig(adjust_direction=self._adjust_direction()),
+                    name=region,
+                )
+                if plan_chunks is not None:
+                    pinned = pin_algorithm_args(strategy, n_seq, max_len)
+                    chunk_dir = os.path.join(
+                        scratch_dir or self._get_worker_scratch(),
+                        f"{region}_chunks",
+                    )
+                    os.makedirs(chunk_dir, exist_ok=True)
+                    plan_chunks.write_chunk_fastas(chunk_dir)
+
+                    def make_chunk(idx: int) -> SchedTask:
+                        spec = plan_chunks.chunks[idx]
+
+                        def chunk_fn(cctx: TaskContext) -> tuple[str, str | None]:
+                            if not spec.needs_alignment:
+                                return ("skip", None)
+                            in_fa = str(plan_chunks.chunk_path(chunk_dir, idx))
+                            out_fa = os.path.join(
+                                chunk_dir, f"{region}.chunk{idx:02d}.aligned.fasta"
+                            )
+                            chunk_summary = {
+                                "count": spec.n_seq,
+                                "max_len": spec.max_len,
+                                "min_len": spec.min_len,
+                            }
+                            try:
+                                ok = self._align_fasta(
+                                    in_fa,
+                                    out_fa,
+                                    summary_entry=chunk_summary,
+                                    support=support,
+                                    ctx=cctx,
+                                    alphabet="nucl",
+                                    algorithm_args=pinned,
+                                )
+                            except Exception as exc:
+                                return ("fail", str(exc))
+                            if not ok or not (
+                                os.path.exists(out_fa) and os.path.getsize(out_fa) > 0
+                            ):
+                                return ("fail", f"chunk {idx} produced no output")
+                            return ("ok", out_fa)
+
+                        return SchedTask(
+                            task_id=f"c{idx:02d}",
+                            fn=chunk_fn,
+                            work=max(1.0, work / max(1, plan_chunks.n_chunks)),
+                            preferred_threads=1,
+                            max_threads=max_threads,
+                            n_seq=spec.n_seq,
+                            max_len=spec.max_len,
+                        )
+
+                    def finalize(fctx: TaskContext, results: list[Any]) -> bool:
+                        try:
+                            paths: list[str | None] = []
+                            failed = False
+                            for idx, result in enumerate(results):
+                                if result is None:
+                                    failed = True
+                                    paths.append(None)
+                                    continue
+                                status, path = result
+                                if status == "fail":
+                                    failed = True
+                                paths.append(path if status == "ok" else None)
+                                if (
+                                    plan_chunks.chunks[idx].needs_alignment
+                                    and status != "ok"
+                                ):
+                                    failed = True
+                            if failed:
+                                log.warning(
+                                    f"chunked alignment of `{region}` failed; "
+                                    "falling back to unchunked"
+                                )
+                                ok = self._align_fasta(
+                                    unalign,
+                                    out_aligned,
+                                    summary_entry=summary_entry,
+                                    support=support,
+                                    ctx=fctx,
+                                    alphabet="nucl",
+                                )
+                                self._record_locus(
+                                    region,
+                                    alphabet="nucl",
+                                    strategy=strategy,
+                                    chunked=False,
+                                    chunk_reason="fallback_after_chunk_failure",
+                                    ok=ok,
+                                )
+                                if ok:
+                                    self._record_success(region, out_aligned)
+                                return ok
+                            splice_alignments(plan_chunks, paths, out_aligned)
+                            self._record_locus(
+                                region,
+                                alphabet="nucl",
+                                strategy=strategy,
+                                chunked=True,
+                                chunk_reason=reason,
+                                ok=True,
+                            )
+                            self._record_success(region, out_aligned)
+                            return True
+                        finally:
+                            _cleanup_unalign()
+
+                    return FanOut(
+                        [make_chunk(i) for i in range(plan_chunks.n_chunks)],
+                        finalizer=finalize,
+                    )
+                chunk_reason = reason
+            else:
+                chunk_reason = "subdivide_skipped"
+
+            try:
+                ok = self._align_fasta(
+                    unalign,
+                    out_aligned,
+                    summary_entry=summary_entry,
+                    support=support,
+                    ctx=ctx,
+                    alphabet="nucl",
+                )
+                if (
+                    ok
+                    and os.path.exists(out_aligned)
+                    and os.path.getsize(out_aligned) > 0
+                ):
+                    self._record_success(region, out_aligned)
+                    self._record_locus(
+                        region,
+                        alphabet="nucl",
+                        strategy=strategy,
+                        chunked=False,
+                        chunk_reason=chunk_reason,
+                        ok=True,
+                    )
+                    return True
+                self._record_locus(
+                    region,
+                    alphabet="nucl",
+                    strategy=strategy,
+                    ok=False,
+                    error="no output",
+                )
+                log.warning(
+                    f"Alignment for `{region}` produced no output: {out_aligned}"
+                )
+                return False
+            finally:
+                _cleanup_unalign()
+
+        return SchedTask(
+            task_id=region,
+            fn=run_locus,
+            work=work,
+            est_mem_bytes=est_mem,
+            preferred_threads=pref,
+            max_threads=max_threads,
+            scratch_bytes=max(1, 3 * bytes_est),
+            n_seq=n_seq,
+            max_len=max_len,
+            meta={"strategy": strategy.to_dict()},
         )
 
-        # Cheap emptiness check: must not hydrate any SeqRecord
+    def _nuc_MSA(self, target_regions: set[str] | None = None):
+        """Aligns nucleotide regions (all of them, or only `target_regions`)."""
+        region_summary = self._get_region_summary("nucl")
         if len(self.plastid_data.nucleotides) == 0:
             log.critical("No items in nucleotide main dictionary to process")
             raise RuntimeError("No items in nucleotide main dictionary to process")
 
-        # Detect supported parameters on the aligner interface
+        plan = self._ensure_plan(region_summary, alphabet="nucl")
         support = self._aligner_support()
-        supports_threads = support["threads"]
-
         regions = self._regions_to_align(target_regions)
-        total_tasks = len(regions)
-
-        # Calculate water-filling schedule from region summary
-        tasks_meta = {
-            k: (
-                region_summary.get(k, {}).get("count", 1),
-                region_summary.get(k, {}).get("max_len", 1),
+        preferred = water_fill_preferences(region_summary, regions, plan.cpu_budget)
+        log.info(
+            "conducting multiple sequence alignments based on nucleotide sequence"
+            f" data using {plan.cpu_budget} threads ({plan.workers} workers)"
+        )
+        tasks = [
+            self._nuc_locus_task(
+                k,
+                region_summary=region_summary,
+                support=support,
+                preferred=preferred.get(k, 1),
+                plan=plan,
             )
             for k in regions
-        }
-        schedule = CoreBudgetPool.solve_water_filling_schedule(
-            tasks_meta, total_cores=num_workers
-        )
-
-        budget_pool = CoreBudgetPool(
-            total_cores=num_workers,
-            total_tasks=total_tasks,
-            max_cores_per_task=None if supports_threads else 1,
-            schedule=schedule if supports_threads else None,
-        )
-
-        ### Inner Function - Start ###
-        def single_nuc_MSA(k: str):
-            log.debug(f" aligning {k}")
-            # Define input and output names
-            fasta_dir = os.path.join(self._out_dir, "fasta")
-            os.makedirs(fasta_dir, exist_ok=True)
-            out_fn_aligned_nucl = os.path.join(fasta_dir, f"nucl_{k}.aligned.fasta")
-
-            out_fn_unalign_nucl, is_temp = self._unaligned_fasta(k, "nucl")
-            file_size = (
-                os.path.getsize(out_fn_unalign_nucl)
-                if os.path.exists(out_fn_unalign_nucl)
-                else 0
-            )
-            summary_entry = region_summary.get(k, {})
-
-            try:
-                try:
-                    with budget_pool.lease(
-                        file_size=file_size, task_id=k
-                    ) as leased_threads:
-                        align_kwargs = self._build_align_kwargs(
-                            summary_entry, leased_threads, support
-                        )
-
-                        # Step 1. Align matrices via third-party alignment tool
-                        self.aligner.align(
-                            out_fn_unalign_nucl, out_fn_aligned_nucl, **align_kwargs
-                        )
-                finally:
-                    budget_pool.task_completed()
-            finally:
-                if is_temp:
-                    self._remove_quietly(out_fn_unalign_nucl)
-
-            # Report whether the aligner produced output
-            if (
-                os.path.exists(out_fn_aligned_nucl)
-                and os.path.getsize(out_fn_aligned_nucl) > 0
-            ):
-                log.debug(f"Alignment successful for `{k}` -> {out_fn_aligned_nucl}")
-            else:
-                log.warning(
-                    f"Alignment for `{k}` produced no output: {out_fn_aligned_nucl}"
-                )
-
-            # Convert aligned nucleotide FASTA to NEXUS in-situ if enabled
-            self._record_success(k, out_fn_aligned_nucl)
-
-        ### Inner Function - End ###
-
-        # Step 2. Use ThreadPoolExecutor to parallelize alignment with LPT ordering
-        max_in_flight = num_workers * 2
-        sorted_regions = [
-            k
-            for k in self._get_lpt_sorted_regions(prefix="nucl")
-            if target_regions is None or k in target_regions
         ]
         try:
-            with ThreadPoolExecutor(max_workers=num_workers) as executor:
-                for k, future in bounded_submit_iterator(
-                    executor,
-                    single_nuc_MSA,
-                    sorted_regions,
-                    max_in_flight=max_in_flight,
-                ):
-                    try:
-                        future.result()
-                    except Exception as e:
-                        log.error(f"{k!r} generated an exception: {e}")
+            self._run_scheduler(tasks, plan)
         finally:
             self._cleanup_worker_scratch()
 
@@ -448,154 +754,320 @@ class AlignmentCoordination:
             with self._success_lock:
                 self.success_list.append((region, aligned_fasta))
 
-    def _prot_MSA(self, target_regions: set[str] | None = None):
-        """Aligns proteins and back-translates them (all regions, or `target_regions`)."""
-        # Pre-fetch region taxon counts in one O(1) bulk query
-        region_summary = self._get_region_summary("prot")
-        num_workers = self._resolve_num_workers()
+    def _prot_locus_task(
+        self,
+        region: str,
+        *,
+        region_summary: Mapping[str, Mapping[str, int]],
+        support: Mapping[str, bool],
+        preferred: int,
+        plan: TuningPlan,
+    ) -> SchedTask:
+        summary_entry = dict(region_summary.get(region, {}))
+        strategy = strategy_for_locus(summary_entry, alphabet="prot")
+        n_seq = int(summary_entry.get("count", 0) or 0)
+        max_len = int(summary_entry.get("max_len", 0) or 0)
+        work = work_for_locus(summary_entry, alphabet="prot")
+        bytes_est = unaligned_bytes_estimate(summary_entry)
+        cap = max(1, int(plan.threads_per_task_cap))
+        pref = max(1, min(int(preferred), cap))
+        max_threads = cap if support.get("threads") else 1
+        est_mem = plan.est_mem_bytes(
+            max(1, n_seq),
+            max(1, max_len),
+            parttree=strategy.uses_parttree,
+            alphabet="protein",
+            threads=pref,
+        )
+        subdivide_mode = str(
+            self.user_params.get("subdivide", "auto") or "auto"
+        ).lower()
 
-        log.info(
-            " conducting multiple sequence alignments based on protein sequence"
-            " data, followed by back-translation to nucleotides using"
-            f" {num_workers} threads"
+        def run_locus(ctx: TaskContext) -> Any:
+            out_dir = self._out_dir
+            fasta_dir = os.path.join(out_dir, "fasta")
+            os.makedirs(fasta_dir, exist_ok=True)
+            out_aligned_nucl = os.path.join(fasta_dir, f"nucl_{region}.aligned.fasta")
+            scratch_dir = str(ctx.scratch.path) if ctx.scratch is not None else None
+            if self.keep_unaligned:
+                out_aligned_prot = os.path.join(out_dir, f"prot_{region}.aligned.fasta")
+                prot_is_temp = False
+            else:
+                base = scratch_dir or self._get_worker_scratch()
+                out_aligned_prot = os.path.join(base, f"prot_{region}.aligned.fasta")
+                prot_is_temp = True
+
+            unalign_prot, prot_unalign_temp = self._unaligned_fasta(
+                region, "prot", scratch_dir=scratch_dir
+            )
+
+            def _cleanup_prot_inputs() -> None:
+                if prot_unalign_temp:
+                    self._remove_quietly(unalign_prot)
+                if prot_is_temp:
+                    self._remove_quietly(out_aligned_prot)
+
+            try_chunks = want_subdivide(
+                mode=subdivide_mode,
+                alphabet="prot",
+                n_seq=n_seq,
+                max_len=max_len,
+                is_mafft=self._is_mafft(),
+                adjust_direction=False,
+                strategy=strategy,
+            )
+            chunk_reason = "subdivide_skipped"
+            if try_chunks:
+                plan_chunks, reason = plan_chunks_with_reason(
+                    unalign_prot,
+                    "prot",
+                    ChunkConfig(),
+                    name=region,
+                )
+                if plan_chunks is not None:
+                    pinned = pin_algorithm_args(strategy, n_seq, max_len)
+                    chunk_dir = os.path.join(
+                        scratch_dir or self._get_worker_scratch(),
+                        f"{region}_prot_chunks",
+                    )
+                    os.makedirs(chunk_dir, exist_ok=True)
+                    plan_chunks.write_chunk_fastas(chunk_dir)
+
+                    def make_chunk(idx: int) -> SchedTask:
+                        spec = plan_chunks.chunks[idx]
+
+                        def chunk_fn(cctx: TaskContext) -> tuple[str, str | None]:
+                            if not spec.needs_alignment:
+                                return ("skip", None)
+                            in_fa = str(plan_chunks.chunk_path(chunk_dir, idx))
+                            out_fa = os.path.join(
+                                chunk_dir, f"{region}.chunk{idx:02d}.aligned.fasta"
+                            )
+                            chunk_summary = {
+                                "count": spec.n_seq,
+                                "max_len": spec.max_len,
+                                "min_len": spec.min_len,
+                            }
+                            try:
+                                ok = self._align_fasta(
+                                    in_fa,
+                                    out_fa,
+                                    summary_entry=chunk_summary,
+                                    support=support,
+                                    ctx=cctx,
+                                    alphabet="prot",
+                                    algorithm_args=pinned,
+                                )
+                            except Exception as exc:
+                                return ("fail", str(exc))
+                            if not ok or not (
+                                os.path.exists(out_fa) and os.path.getsize(out_fa) > 0
+                            ):
+                                return ("fail", f"chunk {idx} produced no output")
+                            return ("ok", out_fa)
+
+                        return SchedTask(
+                            task_id=f"c{idx:02d}",
+                            fn=chunk_fn,
+                            work=max(1.0, work / max(1, plan_chunks.n_chunks)),
+                            preferred_threads=1,
+                            max_threads=max_threads,
+                            n_seq=spec.n_seq,
+                            max_len=spec.max_len,
+                        )
+
+                    def finalize(fctx: TaskContext, results: list[Any]) -> bool:
+                        try:
+                            paths: list[str | None] = []
+                            failed = False
+                            for idx, result in enumerate(results):
+                                if result is None:
+                                    failed = True
+                                    paths.append(None)
+                                    continue
+                                status, path = result
+                                if status == "fail":
+                                    failed = True
+                                paths.append(path if status == "ok" else None)
+                                if (
+                                    plan_chunks.chunks[idx].needs_alignment
+                                    and status != "ok"
+                                ):
+                                    failed = True
+                            if failed:
+                                log.warning(
+                                    f"chunked protein alignment of `{region}` failed; "
+                                    "falling back to unchunked"
+                                )
+                                ok = self._align_fasta(
+                                    unalign_prot,
+                                    out_aligned_prot,
+                                    summary_entry=summary_entry,
+                                    support=support,
+                                    ctx=fctx,
+                                    alphabet="prot",
+                                )
+                            else:
+                                splice_alignments(plan_chunks, paths, out_aligned_prot)
+                                ok = True
+                            return self._finish_protein_locus(
+                                region,
+                                out_aligned_prot,
+                                out_aligned_nucl,
+                                scratch_dir=scratch_dir,
+                                strategy=strategy,
+                                chunked=not failed and ok,
+                                chunk_reason=reason if not failed else "fallback",
+                                ok_align=ok,
+                            )
+                        finally:
+                            _cleanup_prot_inputs()
+
+                    return FanOut(
+                        [make_chunk(i) for i in range(plan_chunks.n_chunks)],
+                        finalizer=finalize,
+                    )
+                chunk_reason = reason
+
+            try:
+                aligned_ok = self._align_fasta(
+                    unalign_prot,
+                    out_aligned_prot,
+                    summary_entry=summary_entry,
+                    support=support,
+                    ctx=ctx,
+                    alphabet="prot",
+                )
+                return self._finish_protein_locus(
+                    region,
+                    out_aligned_prot,
+                    out_aligned_nucl,
+                    scratch_dir=scratch_dir,
+                    strategy=strategy,
+                    chunked=False,
+                    chunk_reason=chunk_reason,
+                    ok_align=aligned_ok,
+                )
+            finally:
+                _cleanup_prot_inputs()
+
+        return SchedTask(
+            task_id=region,
+            fn=run_locus,
+            work=work,
+            est_mem_bytes=est_mem,
+            preferred_threads=pref,
+            max_threads=max_threads,
+            scratch_bytes=max(1, 3 * bytes_est),
+            n_seq=n_seq,
+            max_len=max_len,
+            meta={"strategy": strategy.to_dict()},
         )
 
-        # Cheap emptiness check: must not hydrate any SeqRecord
+    def _finish_protein_locus(
+        self,
+        region: str,
+        aligned_prot: str,
+        aligned_nucl: str,
+        *,
+        scratch_dir: str | None,
+        strategy: AlignmentStrategy,
+        chunked: bool,
+        chunk_reason: str | None,
+        ok_align: bool,
+    ) -> bool:
+        if not (
+            ok_align
+            and os.path.exists(aligned_prot)
+            and os.path.getsize(aligned_prot) > 0
+        ):
+            log.warning(
+                f"Protein alignment for `{region}` produced no output: {aligned_prot}"
+            )
+            self._record_locus(
+                region,
+                alphabet="prot",
+                strategy=strategy,
+                chunked=chunked,
+                chunk_reason=chunk_reason,
+                ok=False,
+                error="no protein output",
+            )
+            return False
+        unalign_nucl, nucl_temp = self._unaligned_fasta(
+            region, "nucl", scratch_dir=scratch_dir
+        )
+        try:
+            translator = BackTranslation(
+                region, aligned_prot, unalign_nucl, aligned_nucl, 11
+            )
+            translator.backtranslate()
+            if not (os.path.exists(aligned_nucl) and os.path.getsize(aligned_nucl) > 0):
+                log.warning(
+                    f"Back-translation produced no output for `{region}`: {aligned_nucl}"
+                )
+                self._record_locus(
+                    region,
+                    alphabet="prot",
+                    strategy=strategy,
+                    chunked=chunked,
+                    ok=False,
+                    error="backtranslate empty",
+                )
+                return False
+            self._record_success(region, aligned_nucl)
+            self._record_locus(
+                region,
+                alphabet="prot",
+                strategy=strategy,
+                chunked=chunked,
+                chunk_reason=chunk_reason,
+                ok=True,
+            )
+            return True
+        except Exception as err:
+            log.warning(f"Unable to conduct back-translation of `{region}`: {err}")
+            self._record_locus(
+                region,
+                alphabet="prot",
+                strategy=strategy,
+                chunked=chunked,
+                ok=False,
+                error=str(err),
+            )
+            return False
+        finally:
+            if nucl_temp:
+                self._remove_quietly(unalign_nucl)
+
+    def _prot_MSA(self, target_regions: set[str] | None = None):
+        """Aligns proteins and back-translates them (all regions, or `target_regions`)."""
+        region_summary = self._get_region_summary("prot")
         if len(self.plastid_data.nucleotides) == 0:
             log.critical("No items in nucleotide main dictionary to process")
             raise RuntimeError("No items in nucleotide main dictionary to process")
 
-        # Detect supported parameters on the aligner interface
+        plan = self._ensure_plan(region_summary, alphabet="prot")
         support = self._aligner_support()
-        supports_threads = support["threads"]
-
         regions = self._regions_to_align(target_regions)
-        total_tasks = len(regions)
-
-        # Calculate water-filling schedule from protein region summary
-        tasks_meta = {
-            k: (
-                region_summary.get(k, {}).get("count", 1),
-                region_summary.get(k, {}).get("max_len", 1),
+        preferred = water_fill_preferences(region_summary, regions, plan.cpu_budget)
+        log.info(
+            " conducting multiple sequence alignments based on protein sequence"
+            " data, followed by back-translation to nucleotides using"
+            f" {plan.cpu_budget} threads ({plan.workers} workers)"
+        )
+        tasks = [
+            self._prot_locus_task(
+                k,
+                region_summary=region_summary,
+                support=support,
+                preferred=preferred.get(k, 1),
+                plan=plan,
             )
             for k in regions
-        }
-        schedule = CoreBudgetPool.solve_water_filling_schedule(
-            tasks_meta, total_cores=num_workers
-        )
-
-        budget_pool = CoreBudgetPool(
-            total_cores=num_workers,
-            total_tasks=total_tasks,
-            max_cores_per_task=None if supports_threads else 1,
-            schedule=schedule if supports_threads else None,
-        )
-
-        ### Inner Function - Start ###
-        def single_prot_MSA(k: str):
-            log.debug(f" aligning {k}")
-            # Define input and output names
-            out_dir = self._out_dir
-            out_fn_aligned_prot = os.path.join(out_dir, f"prot_{k}.aligned.fasta")
-            fasta_dir = os.path.join(out_dir, "fasta")
-            os.makedirs(fasta_dir, exist_ok=True)
-            out_fn_aligned_nucl = os.path.join(fasta_dir, f"nucl_{k}.aligned.fasta")
-
-            out_fn_unalign_prot, prot_is_temp = self._unaligned_fasta(k, "prot")
-            file_size = (
-                os.path.getsize(out_fn_unalign_prot)
-                if os.path.exists(out_fn_unalign_prot)
-                else 0
-            )
-            summary_entry = region_summary.get(k, {})
-
-            try:
-                try:
-                    with budget_pool.lease(
-                        file_size=file_size, task_id=k
-                    ) as leased_threads:
-                        align_kwargs = self._build_align_kwargs(
-                            summary_entry, leased_threads, support
-                        )
-
-                        # Step 1. Align matrices based on their PROTEIN sequences via third-party alignment tool
-                        self.aligner.align(
-                            out_fn_unalign_prot, out_fn_aligned_prot, **align_kwargs
-                        )
-                finally:
-                    budget_pool.task_completed()
-            finally:
-                if prot_is_temp:
-                    self._remove_quietly(out_fn_unalign_prot)
-
-            # Report whether the protein aligner produced output
-            if (
-                os.path.exists(out_fn_aligned_prot)
-                and os.path.getsize(out_fn_aligned_prot) > 0
-            ):
-                log.debug(
-                    f"Protein alignment successful for `{k}` -> {out_fn_aligned_prot}"
-                )
-            else:
-                log.warning(
-                    f"Protein alignment for `{k}` produced no output:"
-                    f" {out_fn_aligned_prot}"
-                )
-                return
-
-            # Step 2. Conduct actual back-translation from PROTEINS TO NUCLEOTIDES
-            out_fn_unalign_nucl, nucl_is_temp = self._unaligned_fasta(k, "nucl")
-            try:
-                translator = BackTranslation(
-                    k,
-                    out_fn_aligned_prot,
-                    out_fn_unalign_nucl,
-                    out_fn_aligned_nucl,
-                    11,
-                )
-                translator.backtranslate()
-                if not (
-                    os.path.exists(out_fn_aligned_nucl)
-                    and os.path.getsize(out_fn_aligned_nucl) > 0
-                ):
-                    log.warning(
-                        f"Back-translation produced no output for `{k}`: {out_fn_aligned_nucl}"
-                    )
-                    return
-                log.debug(
-                    f"Back-translation successful for `{k}` -> {out_fn_aligned_nucl}"
-                )
-            except Exception as err:
-                log.warning(f"Unable to conduct back-translation of `{k}`: {err}")
-                return
-            finally:
-                if nucl_is_temp:
-                    self._remove_quietly(out_fn_unalign_nucl)
-
-            # Step 3. Convert aligned nucleotide FASTA to NEXUS in-situ if enabled
-            self._record_success(k, out_fn_aligned_nucl)
-
-        ### Inner Function - End ###
-
-        # Step 2. Use ThreadPoolExecutor to parallelize alignment and back-translation with LPT ordering
-        max_in_flight = num_workers * 2
-        sorted_regions = [
-            k
-            for k in self._get_lpt_sorted_regions(prefix="prot")
-            if target_regions is None or k in target_regions
         ]
         try:
-            with ThreadPoolExecutor(max_workers=num_workers) as executor:
-                for k, future in bounded_submit_iterator(
-                    executor,
-                    single_prot_MSA,
-                    sorted_regions,
-                    max_in_flight=max_in_flight,
-                ):
-                    try:
-                        future.result()
-                    except Exception as e:
-                        log.error(f"{k} generated an exception: {e}")
+            self._run_scheduler(tasks, plan)
         finally:
             self._cleanup_worker_scratch()
 
@@ -661,200 +1133,92 @@ class AlignmentCoordination:
         return success_list
 
     def concat_MSAs(self):
-        """Concatenate all successful alignments into a single alignment."""
+        """Concatenate successful alignments via :class:`SupermatrixBuilder`."""
         num_successful = len(self.success_list)
         if num_successful == 0:
             log.warning("No successful alignments to concatenate.")
             return
 
-        def _concat_sync(alignm_concat: NexusAlignment):
-            try:
-                if alignm_concat.matrix is None:
-                    raise ValueError("concatenated alignment has no data matrix")
-
-                # 1. Fast linear FASTA export
-                fast_write_fasta(
-                    filename=out_fn_nucl_concat_fasta,
-                    matrix=alignm_concat.matrix,
-                    taxlabels=getattr(alignm_concat, "taxlabels", None),
-                )
-
-                # 2. Fast linear NEXUS export
-                fast_write_nexus(
-                    filename=out_fn_nucl_concat_nexus,
-                    matrix=alignm_concat.matrix,
-                    datatype=getattr(alignm_concat, "datatype", "dna"),
-                    gap=getattr(alignm_concat, "gap", "-"),
-                    missing=getattr(alignm_concat, "missing", "?"),
-                    charpartitions=getattr(alignm_concat, "charpartitions", None),
-                )
-
-                # 3. RAxML-NG and IQ-TREE 2 standalone partition files
-                charparts = getattr(alignm_concat, "charpartitions", None)
-                if charparts:
-                    fast_write_raxml_partitions(
-                        filename=out_fn_nucl_concat_raxml_parts,
-                        charpartitions=charparts,
-                        datatype=getattr(alignm_concat, "datatype", "dna"),
-                    )
-                    fast_write_nexus_partitions(
-                        filename=out_fn_nucl_concat_nexus_parts,
-                        charpartitions=charparts,
-                    )
-            except Exception as e:
-                log.error(f"Failure while exporting alignments: {e}")
-                raise ConcatenationError(
-                    f"Failure while writing concatenated alignments: {e}"
-                ) from e
-
         fasta_dir = os.path.join(self._out_dir, "fasta")
-
-        def _load_alignment_fast(msa_name: str, file_path: str) -> Any:
-            prefix = f"{msa_name}_"
-            r_prefix = f"_R_{msa_name}_"
-
-            # 1. Resolve whether a valid aligned FASTA exists on disk
-            fasta_path = None
-            if file_path.endswith(".nexus"):
-                candidate_fasta = os.path.join(
-                    fasta_dir, f"nucl_{msa_name}.aligned.fasta"
-                )
-                if (
-                    os.path.exists(candidate_fasta)
-                    and os.path.getsize(candidate_fasta) > 0
-                ):
-                    fasta_path = candidate_fasta
-            elif os.path.exists(file_path) and os.path.getsize(file_path) > 0:
-                fasta_path = file_path
-
-            # 2. Fall back to BioPython parser if FASTA is unavailable
-            if fasta_path is None:
-                if not (os.path.exists(file_path) and os.path.getsize(file_path) > 0):
-                    log.warning(
-                        f"Alignment file missing or empty for `{msa_name}`: {file_path}"
-                    )
-                    return None
-                try:
-                    alignm_nexus = NexusAlignment(file_path)
-                    source_matrix = alignm_nexus.matrix
-                    if source_matrix is None:
-                        raise ValueError("NEXUS file has no data matrix")
-                    new_matrix = {}
-                    new_taxlabels = []
-                    for t in alignm_nexus.taxlabels:
-                        clean_t = (
-                            "concat_" + t[len(r_prefix) :]
-                            if t.startswith(r_prefix)
-                            else "concat_" + t[len(prefix) :]
-                            if t.startswith(prefix)
-                            else t
-                        )
-                        new_matrix[clean_t] = source_matrix[t]
-                        new_taxlabels.append(clean_t)
-                    alignm_nexus.matrix = new_matrix
-                    alignm_nexus.taxlabels = new_taxlabels
-                    return alignm_nexus
-                except Exception as err:
-                    log.warning(
-                        f"BioPython failed to parse NEXUS for `{msa_name}` ({file_path}): {err}"
-                    )
-                    return None
-
-            # 3. Fast linear FASTA parse
-            matrix: dict[str, str] = {}
-            taxlabels: list[str] = []
-            try:
-                with open(fasta_path, "r", buffering=1024 * 1024) as f:
-                    curr_id = None
-                    chunks: list[str] = []
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        if line.startswith(">"):
-                            if curr_id:
-                                matrix[curr_id] = "".join(chunks)
-                                taxlabels.append(curr_id)
-                                chunks.clear()
-                            raw_id = line[1:].split()[0]
-                            if raw_id.startswith(r_prefix):
-                                curr_id = "concat_" + raw_id[len(r_prefix) :]
-                            elif raw_id.startswith(prefix):
-                                curr_id = "concat_" + raw_id[len(prefix) :]
-                            else:
-                                curr_id = raw_id
-                        else:
-                            chunks.append(line)
-                    if curr_id:
-                        matrix[curr_id] = "".join(chunks)
-                        taxlabels.append(curr_id)
-
-                if not taxlabels:
-                    return None
-                nchar = len(matrix[taxlabels[0]])
-                return FastNexusMatrix(matrix, taxlabels, nchar)
-            except Exception as err:
-                log.warning(
-                    f"Fast FASTA parser failed for `{msa_name}` ({fasta_path}): {err}"
-                )
-                return None
-
-        raw_threads = self.user_params.get("num_threads", 4) or 4
-        num_workers = min(max(1, int(raw_threads)), 8)
-
         log.info(
             f"concatenating all successful alignments in `{self.plastid_data.order}` order"
         )
         self.plastid_data.set_order_map()
         self.success_list.sort(key=lambda t: self.plastid_data.order_map[t[0]])
 
-        out_fn_nucl_concat_fasta = os.path.join(
-            self._out_dir,
-            f"nucl_{num_successful}concat.aligned.fasta",
-        )
-        out_fn_nucl_concat_nexus = os.path.join(
-            self._out_dir,
-            f"nucl_{num_successful}concat.aligned.nexus",
-        )
-        out_fn_nucl_concat_raxml_parts = os.path.join(
-            self._out_dir,
-            f"nucl_{num_successful}concat.partitions.txt",
-        )
-        out_fn_nucl_concat_nexus_parts = os.path.join(
-            self._out_dir,
-            f"nucl_{num_successful}concat.partitions.nex",
-        )
-
-        try:
-            with ThreadPoolExecutor(max_workers=num_workers) as pool:
-                matrices = list(
-                    pool.map(
-                        lambda pair: _load_alignment_fast(pair[0], pair[1]),
-                        self.success_list,
-                    )
+        mode = self.mode
+        kind = str(getattr(mode, "value", mode) or "nucl").lower()
+        is_cds = bool(mode and getattr(mode, "collects_proteins", lambda: False)())
+        sources: list[LocusSource] = []
+        for name, path in self.success_list:
+            fasta_path = path
+            if path.endswith(".nexus"):
+                candidate = os.path.join(fasta_dir, f"nucl_{name}.aligned.fasta")
+                if os.path.exists(candidate) and os.path.getsize(candidate) > 0:
+                    fasta_path = candidate
+            if not (os.path.exists(fasta_path) and os.path.getsize(fasta_path) > 0):
+                log.warning(f"Alignment file missing or empty for `{name}`: {path}")
+                continue
+            sources.append(
+                LocusSource(
+                    name=name,
+                    path=fasta_path,
+                    kind=kind,
+                    codon_aligned=is_cds,
                 )
+            )
+        if not sources:
+            raise ConcatenationError("no alignment could be loaded")
 
-            accumulator = IncrementalNexusAccumulator()
-            for (msa_name, _), single_matrix in zip(self.success_list, matrices):
-                if single_matrix is not None and getattr(single_matrix, "nchar", 0) > 0:
-                    accumulator.add(msa_name, single_matrix)
-            alignm_concat = accumulator.finalize()
-            if alignm_concat is None:
-                raise ConcatenationError("no alignment could be loaded")
+        raw_threads = self.user_params.get("num_threads", 4) or 4
+        workers = min(max(1, int(raw_threads)), 8)
+        trim = trim_spec_from_params(self.user_params)
+        # Legacy byte parity when trimming is off: leave case as written by MAFFT.
+        normalize = trim is not None
+        try:
+            builder = SupermatrixBuilder(
+                sources,
+                rename=legacy_concat_rename,
+                trim=trim,
+                normalize_case=normalize,
+                max_workers=workers,
+                scratch_dir=str(self._scratch.path),
+                mem_budget_bytes=(
+                    self._plan.task_memory_envelope_bytes if self._plan else None
+                ),
+            )
+            matrix = builder.build()
+            prefix = os.path.join(self._out_dir, f"nucl_{len(sources)}concat")
+            partitions = parse_partitions_flag(self.user_params.get("partitions"))
+            codon = bool(self.user_params.get("codon_partitions", False)) and is_cds
+            written = matrix.write_all(
+                prefix,
+                phylip=bool(self.user_params.get("phylip", False)),
+                partitions=partitions,
+                codon_partitions=codon,
+            )
+            self._supermatrix_info = {
+                "ntax": matrix.ntax,
+                "nchar": matrix.nchar,
+                "nloci": len(sources),
+                "written": {k: str(v) for k, v in written.items()},
+                "trim": trim,
+                "partitions": list(partitions),
+                "codon_partitions": codon,
+            }
         except Exception as e:
             log.critical(f"Unable to concatenate alignments: {e}")
             raise ConcatenationError(f"Alignment concatenation failed: {e}") from e
 
-        _concat_sync(alignm_concat)
-
     def _get_lpt_sorted_regions(self, prefix: str = "nucl") -> list[str]:
         """Sort region keys in descending order of computational work (LPT first).
 
-        Uses theoretical work W = N * L^2 from the database summary when available,
-        falling back to unaligned file size. Ties are broken deterministically by name.
+        Uses :func:`estimate_work` from the database summary when available,
+        falling back to unaligned file size. Ties break deterministically by name.
         """
         out_dir = self.user_params.get("out_dir", "")
         keys = list(self.plastid_data.nucleotides.keys())
+        alphabet = "prot" if prefix == "prot" else "nucl"
 
         try:
             summary = self.plastid_data.store.get_region_summary(seq_type=prefix)
@@ -862,7 +1226,6 @@ class AlignmentCoordination:
             summary = {}
 
         def task_weight(k: str) -> tuple[float, str]:
-            # Priority 1: Calibrated complexity scaling from SQLite summary
             if (
                 isinstance(summary, dict)
                 and k in summary
@@ -871,10 +1234,8 @@ class AlignmentCoordination:
                 count = summary[k].get("count", 0) or 0
                 max_len = summary[k].get("max_len", 0) or 0
                 if count > 0 and max_len > 0:
-                    exp = 2.4 if max_len >= 1800 else (2.1 if max_len >= 1200 else 2.0)
-                    return (-float(count * (max_len**exp)), k)
+                    return (-float(estimate_work(count, max_len, alphabet=alphabet)), k)
 
-            # Priority 2: Unaligned file size on disk
             path = os.path.join(out_dir, f"{prefix}_{k}.unalign.fasta")
             try:
                 size = os.path.getsize(path)

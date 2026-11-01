@@ -7,13 +7,17 @@ import json
 import shutil
 import tempfile
 import unittest
+from importlib import import_module
 from pathlib import Path
 
 import hostfs_builder as hb
 
-from plastburstalign import autotune as at
 from plastburstalign.hardware import HostProfile, MemoryInfo, detect_host
 from plastburstalign.topology import CpuTopology
+
+# Package attribute ``plastburstalign.autotune`` is the public API callable;
+# the implementation module lives in ``sys.modules``.
+at = import_module("plastburstalign.autotune")
 
 GIB = 1024**3
 MIB = 1024**2

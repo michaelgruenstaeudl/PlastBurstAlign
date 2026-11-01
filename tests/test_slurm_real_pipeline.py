@@ -61,11 +61,11 @@ class PartitionWeightTests(unittest.TestCase):
         self.out_dir = self.tmp.name
 
     def test_alpha_tiers(self) -> None:
+        from plastburstalign.strategy import estimate_work
+
         work = ClusterPartitionEngine.estimate_alignment_work
-        self.assertEqual(work(10, 999), round(10 * 999**2.0))
-        self.assertEqual(work(10, 1000), round(10 * 1000**2.2))
-        self.assertEqual(work(10, 2499), round(10 * 2499**2.2))
-        self.assertEqual(work(10, 2500), round(10 * 2500**2.4))
+        for n, length in ((10, 999), (10, 1000), (10, 2499), (10, 2500)):
+            self.assertEqual(work(n, length), round(estimate_work(n, length)))
         self.assertEqual(work(0, 1000), 0)
         self.assertEqual(work(10, 0), 0)
 

@@ -10,7 +10,7 @@ import shutil
 import subprocess
 import tempfile
 from abc import ABC, abstractmethod
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from typing import IO, Any, Dict, List, NamedTuple, Optional
 
 from .ephemeral_engine import EphemeralScratchManager
@@ -23,9 +23,66 @@ from .strategy import (
     normalize_alphabet,
 )
 from .strategy_constants import DEFAULT_CONSTANTS
+from .task_queue import pin_command
 
 #: Translation table dropping everything that is not a residue (stop, gaps, space).
 _NON_RESIDUES = str.maketrans("", "", "*-. \t\r\n")
+
+# Resolver kinds understood by ``get_alignment_tool``. ``generic`` / unknown
+# names stay on ``GenericAlignmentTool`` and never fall through to the builtin.
+_RESOLVER_KINDS = {
+    "mafft": "mafft",
+    "clustal": "clustalo",
+    "clustalo": "clustalo",
+    "clustal-omega": "clustalo",
+    "muscle": "muscle",
+}
+
+
+def mafft_auto_explicit_args(n_seq: int, max_len: int) -> tuple[str, ...]:
+    """Explicit MAFFT 7.526 flags equivalent to ``--auto`` (never contains ``--auto``).
+
+    The decision tree is the one in the MAFFT 7.526 ``mafft`` wrapper
+    (``nlen`` / ``nseq`` branches around the ``auto=1`` block). It was checked
+    by running that binary on a simulated 8-sequence locus:
+
+    * 8000 bp, ``mafft --auto`` prints ``FFT-NS-i (Standard)``, and so does
+      ``mafft --retree 2 --maxiterate 2``;
+    * 2500 bp, ``mafft --auto`` prints ``L-INS-i``.
+
+    Chunk alignments must be pinned to the full-locus flags. Passing ``--auto``
+    to a ~2.5 kb chunk would silently switch an 8 kb FFT-NS-i locus to L-INS-i.
+    """
+    nlen = max(0, int(max_len))
+    nseq = max(0, int(n_seq))
+    if nlen < 3000 and nseq < 100:
+        return ("--localpair", "--maxiterate", "1000")
+    if nlen < 1000 and nseq < 200:
+        return ("--localpair", "--maxiterate", "2")
+    if nlen < 10000 and nseq < 500:
+        return ("--retree", "2", "--maxiterate", "2")
+    if nseq < 200000:
+        # FFT-NS-2. Above 20k sequences MAFFT also enables its memsave guide
+        # tree; the algorithm flags stay ``--retree 2`` until 100k, then
+        # ``--retree 1``.
+        return ("--retree", "1") if nseq >= 100000 else ("--retree", "2")
+    if nlen < 3000:
+        return ("--parttree",)
+    return ("--parttree", "--retree", "1")
+
+
+def mafft_auto_is_fft(n_seq: int, max_len: int) -> bool:
+    """True when ``--auto`` would *not* select a pairwise (L/G/E-INS) algorithm.
+
+    ``subdivide=auto`` chunks only in this regime: that is the 8 kb measurement
+    above, where the full locus is FFT-NS-i and a short chunk would otherwise
+    become L-INS-i. Shorter loci that ``--auto`` already aligns with L-INS-i
+    stay whole.
+    """
+    flags = mafft_auto_explicit_args(n_seq, max_len)
+    return not any(
+        flag in flags for flag in ("--localpair", "--globalpair", "--genafpair")
+    )
 
 
 def _read_fasta_records(path: str) -> list[tuple[str, str]]:
@@ -101,6 +158,8 @@ class AlignmentTool(ABC):
             "scratch_dir", self.user_params.get("scratch_dir")
         )
         self.scratch_mgr = EphemeralScratchManager(custom_scratch_dir=custom_scratch)
+        self.resolved_version: str | None = None
+        self.resolved_path: str | None = None
 
         if tool_path:
             self._validate_tool_path(tool_path)
@@ -364,6 +423,9 @@ class MAFFT(AlignmentTool):
             cmd.append("--adjustdirection")
         if self.tool_params.get("quiet"):
             cmd.append("--quiet")
+        seed = self.user_params.get("seed")
+        if seed is not None:
+            cmd.extend(["--randomseed", str(int(seed))])
         cmd.append(input_file)
         return cmd
 
@@ -441,7 +503,12 @@ class MAFFT(AlignmentTool):
     # running
     # ------------------------------------------------------------------
 
-    def _run_to_file(self, cmd: list[str], output_file: str) -> bool:
+    def _run_to_file(
+        self,
+        cmd: list[str],
+        output_file: str,
+        env: Mapping[str, str] | None = None,
+    ) -> bool:
         """Run ``cmd`` with stdout redirected to ``output_file``."""
         with open(output_file, "w") as out_handle:
             process = subprocess.run(
@@ -450,12 +517,33 @@ class MAFFT(AlignmentTool):
                 stderr=subprocess.DEVNULL,
                 text=True,
                 check=False,
-                env=self._get_subprocess_env(),
+                env=dict(env) if env is not None else self._get_subprocess_env(),
             )
         if process.returncode == 0:
             return True
         log.error(f"   MAFFT failed with return code {process.returncode}")
         return False
+
+    def _prepare_cmd(
+        self,
+        cmd: list[str],
+        *,
+        cpu_ids: Sequence[int] | None,
+        pin: bool,
+    ) -> list[str]:
+        """Prefix ``taskset -c`` when the scheduler asked for pinning."""
+        if pin:
+            return pin_command(cmd, cpu_ids)
+        return list(cmd)
+
+    def _fragment_scratch(self, env: Mapping[str, str] | None) -> str:
+        """Directory for the short-sequence split, inside the task TMPDIR when set."""
+        base = None
+        if env is not None and env.get("TMPDIR"):
+            base = env["TMPDIR"]
+        else:
+            base = str(self.scratch_mgr.path)
+        return tempfile.mkdtemp(prefix="pba_frag_", dir=base)
 
     def _align_with_fragments(
         self,
@@ -464,6 +552,10 @@ class MAFFT(AlignmentTool):
         threads: int | None,
         strategy: AlignmentStrategy,
         alphabet: str,
+        *,
+        cpu_ids: Sequence[int] | None = None,
+        env: Mapping[str, str] | None = None,
+        pin: bool = False,
     ) -> bool:
         """Align a locus that has sequences too short for PartTree.
 
@@ -512,10 +604,14 @@ class MAFFT(AlignmentTool):
                 f"      fewer than 2 sequences of >= {min_ok} residues in "
                 f"{os.path.basename(input_file)}; using --auto for this small locus"
             )
-            cmd = self._assemble_command(["--auto"], input_file, threads, alphabet)
-            return self._run_to_file(cmd, output_file)
+            cmd = self._prepare_cmd(
+                self._assemble_command(["--auto"], input_file, threads, alphabet),
+                cpu_ids=cpu_ids,
+                pin=pin,
+            )
+            return self._run_to_file(cmd, output_file, env=env)
 
-        scratch = tempfile.mkdtemp(prefix="pba_frag_", dir=str(self.scratch_mgr.path))
+        scratch = self._fragment_scratch(env)
         try:
             main_fa = os.path.join(scratch, "main.fa")
             short_fa = os.path.join(scratch, "short.fa")
@@ -524,14 +620,16 @@ class MAFFT(AlignmentTool):
             _write_fasta_records(main_fa, ((f"m{i}", records[i][1]) for i in main))
             _write_fasta_records(short_fa, ((f"m{i}", records[i][1]) for i in short))
 
-            cmd = self._assemble_command(
-                strategy.mafft_args, main_fa, threads, alphabet
+            cmd = self._prepare_cmd(
+                self._assemble_command(strategy.mafft_args, main_fa, threads, alphabet),
+                cpu_ids=cpu_ids,
+                pin=pin,
             )
             log.info(
                 f"      short-sequence path: aligning {len(main)} sequences with "
                 f"{strategy.tier.name}, then adding {len(short)} short sequence(s)"
             )
-            if not self._run_to_file(cmd, main_aln):
+            if not self._run_to_file(cmd, main_aln, env=env):
                 return False
             aligned_path = main_aln
             if short:
@@ -551,7 +649,8 @@ class MAFFT(AlignmentTool):
                 if self.tool_params.get("quiet"):
                     add_cmd.append("--quiet")
                 add_cmd.append(main_aln)
-                if not self._run_to_file(add_cmd, combined_aln):
+                add_cmd = self._prepare_cmd(add_cmd, cpu_ids=cpu_ids, pin=pin)
+                if not self._run_to_file(add_cmd, combined_aln, env=env):
                     return False
                 aligned_path = combined_aln
 
@@ -602,6 +701,10 @@ class MAFFT(AlignmentTool):
         max_len: int | None = None,
         min_len: int | None = None,
         alphabet: str | None = None,
+        algorithm_args: Sequence[str] | None = None,
+        cpu_ids: Sequence[int] | None = None,
+        env: Mapping[str, str] | None = None,
+        pin: bool = False,
         **kwargs: Any,
     ) -> bool:
         """Perform alignment using MAFFT with dynamic threads and adaptive heuristics.
@@ -609,13 +712,34 @@ class MAFFT(AlignmentTool):
         `sequence_count`, `max_len` and `min_len` are optional hints (typically from
         the feature store) that spare the strategy resolution a scan of the input
         file. `alphabet` (``"nucl"``/``"prot"``) overrides the ``prot_`` filename
-        detection.
+        detection. `algorithm_args` pins the algorithm (used for sub-locus chunks);
+        it must not contain ``--auto``. `cpu_ids` / `pin` prefix ``taskset`` when
+        the scheduler is pinning, and `env` is the child environment (``TMPDIR``).
         """
         if not self._validate_input(input_file, output_file):
             return False
 
         try:
             alpha = self._detect_alphabet(input_file, alphabet)
+            if algorithm_args is not None:
+                pinned = tuple(str(arg) for arg in algorithm_args)
+                if "--auto" in pinned:
+                    raise ValueError(
+                        "chunk alignments must not pass --auto; pin the full-locus "
+                        "algorithm instead"
+                    )
+                cmd = self._prepare_cmd(
+                    self._assemble_command(pinned, input_file, threads, alpha),
+                    cpu_ids=cpu_ids,
+                    pin=pin,
+                )
+                if self._run_to_file(cmd, output_file, env=env):
+                    log.info(
+                        f"      successfully aligned {os.path.basename(input_file)} "
+                        f"using MAFFT ({' '.join(cmd[1:])})"
+                    )
+                    return True
+                return False
             if self._explicit_algorithm() is None and self._adaptive_enabled():
                 resolved = self._resolve_strategy(
                     input_file, sequence_count, max_len, min_len, alpha
@@ -627,7 +751,14 @@ class MAFFT(AlignmentTool):
                         f"{resolved.strategy.reason}"
                     )
                     return self._align_with_fragments(
-                        input_file, output_file, threads, resolved.strategy, alpha
+                        input_file,
+                        output_file,
+                        threads,
+                        resolved.strategy,
+                        alpha,
+                        cpu_ids=cpu_ids,
+                        env=env,
+                        pin=pin,
                     )
                 # forward the resolved statistics so the command build never rescans
                 sequence_count, max_len, min_len = (
@@ -635,15 +766,19 @@ class MAFFT(AlignmentTool):
                     resolved.max_len,
                     resolved.min_len,
                 )
-            cmd = self._build_command(
-                input_file,
-                threads=threads,
-                sequence_count=sequence_count,
-                max_len=max_len,
-                min_len=min_len,
-                alphabet=alpha,
+            cmd = self._prepare_cmd(
+                self._build_command(
+                    input_file,
+                    threads=threads,
+                    sequence_count=sequence_count,
+                    max_len=max_len,
+                    min_len=min_len,
+                    alphabet=alpha,
+                ),
+                cpu_ids=cpu_ids,
+                pin=pin,
             )
-            if self._run_to_file(cmd, output_file):
+            if self._run_to_file(cmd, output_file, env=env):
                 log.info(
                     f"      successfully aligned {os.path.basename(input_file)} using"
                     f" MAFFT ({' '.join(cmd[1:])})"
@@ -672,6 +807,7 @@ class ClustalOmega(AlignmentTool):
         output_file: str,
         threads: int | None = None,
         sequence_count: int | None = None,
+        **kwargs: Any,
     ) -> bool:
         """Perform alignment using Clustal Omega."""
         if not self._validate_input(input_file, output_file):
@@ -699,6 +835,9 @@ class ClustalOmega(AlignmentTool):
             if self.tool_params.get("verbose"):
                 cmd.append("--verbose")
 
+            if kwargs.get("pin"):
+                cmd = pin_command(cmd, kwargs.get("cpu_ids"))
+            child_env = kwargs.get("env")
             log.debug(f"   running Clustal Omega with command: {' '.join(cmd)}")
             process = subprocess.run(
                 cmd,
@@ -706,7 +845,7 @@ class ClustalOmega(AlignmentTool):
                 stderr=subprocess.DEVNULL,
                 text=True,
                 check=False,
-                env=self._get_subprocess_env(),
+                env=dict(child_env) if child_env else self._get_subprocess_env(),
             )
             if process.returncode == 0:
                 log.info(
@@ -741,6 +880,7 @@ class MUSCLE(AlignmentTool):
         output_file: str,
         threads: int | None = None,
         sequence_count: int | None = None,
+        **kwargs: Any,
     ) -> bool:
         """Perform alignment using MUSCLE v5."""
         if not self._validate_input(input_file, output_file):
@@ -768,6 +908,9 @@ class MUSCLE(AlignmentTool):
             if eff_threads is not None and int(eff_threads) > 1:
                 cmd.extend(["-threads", str(eff_threads)])
 
+            if kwargs.get("pin"):
+                cmd = pin_command(cmd, kwargs.get("cpu_ids"))
+            child_env = kwargs.get("env")
             log.debug(f"   running MUSCLE with command: {' '.join(cmd)}")
             process = subprocess.run(
                 cmd,
@@ -775,7 +918,7 @@ class MUSCLE(AlignmentTool):
                 stderr=subprocess.DEVNULL,
                 text=True,
                 check=False,
-                env=self._get_subprocess_env(),
+                env=dict(child_env) if child_env else self._get_subprocess_env(),
             )
             if process.returncode == 0:
                 log.info(
@@ -872,12 +1015,16 @@ class GenericAlignmentTool(AlignmentTool):
         output_file: str,
         threads: int | None = None,
         sequence_count: int | None = None,
+        **kwargs: Any,
     ) -> bool:
         if not self._validate_input(input_file, output_file):
             return False
 
         try:
             cmd = self._build_command(input_file, output_file, threads=threads)
+            if kwargs.get("pin"):
+                cmd = pin_command(cmd, kwargs.get("cpu_ids"))
+            child_env = kwargs.get("env")
             log.debug(f"   running generic aligner with command: {' '.join(cmd)}")
             process = subprocess.run(
                 cmd,
@@ -885,7 +1032,7 @@ class GenericAlignmentTool(AlignmentTool):
                 stderr=subprocess.DEVNULL,
                 text=True,
                 check=False,
-                env=self._get_subprocess_env(),
+                env=dict(child_env) if child_env else self._get_subprocess_env(),
             )
             if process.returncode == 0:
                 log.info(
@@ -908,6 +1055,13 @@ def get_alignment_tool(
     user_params: Optional[Dict[str, Any]] = None,
     tool_path: Optional[str] = None,
 ) -> Optional[AlignmentTool]:
+    """Build the aligner for this run.
+
+    Known external tools go through :func:`aligner_resolver.resolve_aligner`.
+    When that returns ``None`` (nothing on ``PATH``, or
+    ``PBA_FORCE_BUILTIN_ALIGNER``), the built-in center-star aligner is used.
+    An explicit command template still selects :class:`CustomAligner`.
+    """
     user_params = user_params or {}
     custom_cmd = user_params.get("alignment_command") or user_params.get(
         "alignment_tool_config", {}
@@ -925,17 +1079,42 @@ def get_alignment_tool(
     else:
         tool_name = tool_name.lower().strip()
 
-    if tool_name == "mafft":
-        return MAFFT(user_params, tool_path)
-    elif tool_name in ["clustal", "clustalo", "clustal-omega"]:
-        return ClustalOmega(user_params, tool_path)
-    elif tool_name == "muscle":
-        return MUSCLE(user_params, tool_path)
-    elif tool_name == "generic":
+    kind = _RESOLVER_KINDS.get(tool_name)
+    if kind is None:
+        if tool_name != "generic":
+            log.warning(
+                f"unknown alignment tool: {tool_name}; attempting generic wrapper"
+            )
         return GenericAlignmentTool(user_params, tool_path)
+
+    from .aligner_resolver import resolve_aligner
+
+    explicit = tool_path or user_params.get("alignment_tool_path")
+    resolved = resolve_aligner(kind, explicit if isinstance(explicit, str) else None)
+    if resolved is None:
+        # Imported lazily: builtin_aligner imports AlignmentTool from this module.
+        from .builtin_aligner import BuiltinAligner
+
+        log.warning(
+            f"no working {kind} executable found; using the built-in center-star "
+            "aligner (lower accuracy; set PBA_FORCE_BUILTIN_ALIGNER to force this)"
+        )
+        aligner: AlignmentTool = BuiltinAligner(user_params)
+        return aligner
+
+    log.info(
+        f"resolved {resolved.kind} {resolved.version} at {resolved.path} "
+        f"({resolved.source})"
+    )
+    if kind == "mafft":
+        tool: AlignmentTool = MAFFT(user_params, resolved.path)
+    elif kind == "muscle":
+        tool = MUSCLE(user_params, resolved.path)
     else:
-        log.warning(f"unknown alignment tool: {tool_name}; attempting generic wrapper")
-        return GenericAlignmentTool(user_params, tool_path)
+        tool = ClustalOmega(user_params, resolved.path)
+    tool.resolved_version = resolved.version
+    tool.resolved_path = resolved.path
+    return tool
 
 
 class CustomAligner(AlignmentTool):
@@ -1005,6 +1184,7 @@ class CustomAligner(AlignmentTool):
         output_file: str,
         threads: int | None = None,
         sequence_count: int | None = None,
+        **kwargs: Any,
     ) -> bool:
         if not os.path.exists(input_file):
             log.error(f"Input file does not exist: {input_file}")
@@ -1016,6 +1196,7 @@ class CustomAligner(AlignmentTool):
         log.info(f"Executing custom alignment command: {cmd_str}")
 
         try:
+            child_env = kwargs.get("env")
             process = subprocess.run(
                 cmd_str,
                 shell=True,
@@ -1023,7 +1204,7 @@ class CustomAligner(AlignmentTool):
                 stderr=subprocess.PIPE,
                 text=True,
                 check=False,
-                env=self._get_subprocess_env(),
+                env=dict(child_env) if child_env else self._get_subprocess_env(),
             )
 
             if process.returncode != 0:

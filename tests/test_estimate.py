@@ -6,11 +6,11 @@ import dataclasses
 import io
 import json
 import unittest
+from importlib import import_module
 from unittest import mock
 
 from rich.console import Console
 
-from plastburstalign import estimate as est_mod
 from plastburstalign.autotune import TuningPlan, autotune
 from plastburstalign.chunking import ChunkConfig
 from plastburstalign.estimate import (
@@ -24,6 +24,10 @@ from plastburstalign.estimate import (
 from plastburstalign.hardware import HostProfile, MemoryInfo, StorageTier
 from plastburstalign.scheduler_sim import Policy, SimTask, simulate
 from plastburstalign.topology import CpuTopology
+
+# Package attribute ``plastburstalign.estimate`` is the public API callable;
+# the implementation module lives in ``sys.modules``.
+est_mod = import_module("plastburstalign.estimate")
 
 GIB = 1024**3
 MIB = 1024**2

@@ -6,8 +6,10 @@ from __future__ import annotations
 
 import datetime
 import os
+import time
 from typing import Any
 
+from .align_runtime import clear_stale_outputs
 from .alignment_ops import AlignmentCoordination
 from .cluster_ops import (
     ClusterExecutionError,
@@ -18,6 +20,7 @@ from .cluster_ops import (
 )
 from .extraction_ops import DataCleaning, ExtractAndCollect
 from .logging_ops import logger as log
+from .manifest import write_run_manifest
 from .seqfeature_ops import PlastidData
 from .user_parameters import SelectMode, UserParameters
 
@@ -36,6 +39,10 @@ class PlastBurstAlign:
         else:
             self.user_params = user_params
 
+        # Last AlignmentCoordination from a monolithic/finalize run (for
+        # post-flight dashboard / ScalingReport). Cleared on each execute().
+        self.last_aligncoord: AlignmentCoordination | None = None
+
         # In cluster worker or finalize mode, bypass raw GenBank file inspection
         is_worker_or_final = (
             self.user_params.get("align_partition") is not None
@@ -43,6 +50,9 @@ class PlastBurstAlign:
         )
         self.plastid_data: PlastidData | None
         if not is_worker_or_final:
+            # Fresh monolithic/export runs must not reuse a previous feature store
+            # or leftover unaligned FASTA files.
+            clear_stale_outputs(str(self.user_params.get("out_dir", ".")))
             self.plastid_data = PlastidData(self.user_params)
         else:
             self.plastid_data = None
@@ -57,6 +67,7 @@ class PlastBurstAlign:
 
     def execute(self):
         """Dispatches execution based on user parameters."""
+        self.last_aligncoord = None
         if self.user_params.get("align_partition") is not None:
             self._execute_worker()
         elif self.user_params.get("finalize_slurm"):
@@ -66,19 +77,66 @@ class PlastBurstAlign:
         else:
             self._execute_monolithic()
 
+    def _write_manifest(
+        self,
+        *,
+        started_at: datetime.datetime,
+        wall_seconds: float,
+        aligncoord: AlignmentCoordination | None,
+        ok: bool,
+    ) -> None:
+        aligner = getattr(aligncoord, "aligner", None) if aligncoord else None
+        write_run_manifest(
+            str(self.user_params.get("out_dir", ".")),
+            started_at=started_at,
+            wall_seconds=wall_seconds,
+            params=self.user_params,
+            plan=getattr(aligncoord, "_plan", None) if aligncoord else None,
+            locus_records=list(getattr(aligncoord, "_locus_records", []) or [])
+            if aligncoord
+            else None,
+            scheduler_report=getattr(aligncoord, "_scheduler_report", None)
+            if aligncoord
+            else None,
+            scratch_stats=aligncoord.scratch_stats() if aligncoord else None,
+            supermatrix=getattr(aligncoord, "_supermatrix_info", None)
+            if aligncoord
+            else None,
+            aligner_version=getattr(aligner, "resolved_version", None),
+            aligner_path=getattr(aligner, "resolved_path", None)
+            or getattr(aligner, "exec_path", None),
+            ok=ok,
+        )
+
     def _execute_monolithic(self):
         """Standard single-node monolithic execution."""
-        plastid_data = self._require_plastid_data()
-        extractor = ExtractAndCollect(plastid_data, self.user_params)
-        extractor.extract()
+        started = datetime.datetime.now(datetime.timezone.utc)
+        t0 = time.monotonic()
+        aligncoord: AlignmentCoordination | None = None
+        ok = False
+        try:
+            plastid_data = self._require_plastid_data()
+            extractor = ExtractAndCollect(plastid_data, self.user_params)
+            extractor.extract()
 
-        cleaner = DataCleaning(plastid_data, self.user_params)
-        cleaner.clean()
+            cleaner = DataCleaning(plastid_data, self.user_params)
+            cleaner.clean()
 
-        aligncoord = AlignmentCoordination(plastid_data, self.user_params)
-        aligncoord.perform_MSAs()
-        if self.user_params.get("concat"):
-            aligncoord.concat_MSAs()
+            aligncoord = AlignmentCoordination(plastid_data, self.user_params)
+            aligncoord.perform_MSAs()
+            if self.user_params.get("concat"):
+                aligncoord.concat_MSAs()
+            ok = True
+        finally:
+            if aligncoord is not None:
+                aligncoord.close_scratch()
+                self.last_aligncoord = aligncoord
+            self._write_manifest(
+                started_at=started,
+                wall_seconds=time.monotonic() - t0,
+                aligncoord=aligncoord,
+                ok=ok,
+            )
 
     def _execute_export(self):
         """Extracts and cleans features, exports partition manifest and Slurm job scripts."""
@@ -207,8 +265,10 @@ class PlastBurstAlign:
         # Initialize minimal PlastidData connecting to the existing SQLite store
         self.plastid_data = PlastidData(self.user_params)
         aligncoord = AlignmentCoordination(self.plastid_data, self.user_params)
-
-        successful_regions = aligncoord.align_partition_regions(assigned_regions)
+        try:
+            successful_regions = aligncoord.align_partition_regions(assigned_regions)
+        finally:
+            aligncoord.close_scratch()
 
         # Record atomic receipt
         PartitionReceipt.write_receipt(
@@ -224,6 +284,8 @@ class PlastBurstAlign:
 
     def _execute_finalize(self):
         """Finalizer task execution: validates receipts and concatenates supermatrices."""
+        started = datetime.datetime.now(datetime.timezone.utc)
+        t0 = time.monotonic()
         out_dir: str = self.user_params["out_dir"]
         manifest_path = self.user_params.get("manifest_path") or os.path.join(
             out_dir, "slurm_manifest.json"
@@ -250,6 +312,18 @@ class PlastBurstAlign:
 
         self.plastid_data = PlastidData(self.user_params)
         aligncoord = AlignmentCoordination(self.plastid_data, self.user_params)
-        aligncoord.collect_partition_nexus(successful_regions)
-        aligncoord.concat_MSAs()
-        log.info("Cluster finalization and concatenation completed successfully.")
+        ok = False
+        try:
+            aligncoord.collect_partition_nexus(successful_regions)
+            aligncoord.concat_MSAs()
+            ok = True
+            log.info("Cluster finalization and concatenation completed successfully.")
+        finally:
+            aligncoord.close_scratch()
+            self.last_aligncoord = aligncoord
+            self._write_manifest(
+                started_at=started,
+                wall_seconds=time.monotonic() - t0,
+                aligncoord=aligncoord,
+                ok=ok,
+            )

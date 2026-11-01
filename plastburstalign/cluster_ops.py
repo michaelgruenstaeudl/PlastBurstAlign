@@ -84,20 +84,18 @@ class ClusterPartitionEngine:
     """Partitions alignment tasks across cluster workers using Greedy LPT bin packing."""
 
     @staticmethod
-    def estimate_alignment_work(count: int, max_len: int) -> int:
-        """Alignment work estimate W = N * L^alpha (same tiers as the MAFFT heuristic).
+    def estimate_alignment_work(
+        count: int, max_len: int, *, alphabet: str = "nucl"
+    ) -> int:
+        """Alignment work estimate via :func:`strategy.estimate_work`.
 
-        alpha is 2.0 for L < 1000, 2.2 for L < 2500 and 2.4 otherwise.
+        Returns 0 for empty loci so the caller can fall back to file sizes.
         """
         if count <= 0 or max_len <= 0:
             return 0
-        if max_len < 1000:
-            alpha = 2.0
-        elif max_len < 2500:
-            alpha = 2.2
-        else:
-            alpha = 2.4
-        return int(round(float(count) * (float(max_len) ** alpha)))
+        from .strategy import estimate_work
+
+        return int(round(estimate_work(count, max_len, alphabet=alphabet)))
 
     @classmethod
     def _weights_and_kind(
@@ -107,6 +105,7 @@ class ClusterPartitionEngine:
         prefix: str,
         region_summary: dict[str, dict[str, int]] | None,
     ) -> tuple[dict[str, int], str]:
+        alphabet = "prot" if prefix == "prot" else "nucl"
         if region_summary:
             work: dict[str, int] = {}
             for r in regions:
@@ -114,7 +113,9 @@ class ClusterPartitionEngine:
                 if not isinstance(entry, dict):
                     break
                 weight = cls.estimate_alignment_work(
-                    int(entry.get("count", 0) or 0), int(entry.get("max_len", 0) or 0)
+                    int(entry.get("count", 0) or 0),
+                    int(entry.get("max_len", 0) or 0),
+                    alphabet=alphabet,
                 )
                 if weight <= 0:
                     break

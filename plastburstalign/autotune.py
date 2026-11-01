@@ -75,9 +75,10 @@ _GIB = 1024**3
 # Everything tunable lives in this block (plus MemoryModel below).
 # ============================================================================ #
 
-#: Use SMT siblings by default? PROVISIONAL: physical cores only. The
-#: calibration phase measures 6 vs 12 workers on the reference machine and
-#: may flip this; users override per run with ``smt=True/False``.
+#: Use SMT siblings by default? PROVISIONAL: physical cores only. 2026-11-01
+#: on a Ryzen 5650U: 6 vs 12 workers on a 24-taxon CDS set gave only ~1.16×
+#: wall (1.92 s → 1.65 s); keep physical-only until a clearer win. Users
+#: override per run with ``smt=True/False``.
 DEFAULT_USE_SMT: bool = False
 
 #: Fraction of the available memory (min of host available, cgroup headroom,
@@ -141,7 +142,9 @@ class MemoryModel:
 
     calibrated: bool = False
     provenance: str = (
-        "PROVISIONAL analytic estimates; not yet measured with RUSAGE_CHILDREN"
+        "PROVISIONAL analytic estimates; 2026-11-01 reduced-grid ACCURATE RSS "
+        "@8t was ~0.6–2.7× this model (200–460 MB observed) — not refit; "
+        "see docs/calibration.md"
     )
     mafft_base_bytes: int = 64 * _MIB
     mafft_bytes_per_residue: float = 8.0
