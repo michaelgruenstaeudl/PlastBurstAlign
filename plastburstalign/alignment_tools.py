@@ -514,14 +514,16 @@ class MAFFT(AlignmentTool):
             process = subprocess.run(
                 cmd,
                 stdout=out_handle,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
                 text=True,
                 check=False,
                 env=dict(env) if env is not None else self._get_subprocess_env(),
             )
         if process.returncode == 0:
             return True
-        log.error(f"   MAFFT failed with return code {process.returncode}")
+        err_msg = (process.stderr or "").strip()
+        cmd_str = " ".join(cmd)
+        log.error(f"    MAFFT failed [cmd: {cmd_str}] (rc={process.returncode}):\n{err_msg}")
         return False
 
     def _prepare_cmd(
@@ -651,7 +653,18 @@ class MAFFT(AlignmentTool):
                 add_cmd.append(main_aln)
                 add_cmd = self._prepare_cmd(add_cmd, cpu_ids=cpu_ids, pin=pin)
                 if not self._run_to_file(add_cmd, combined_aln, env=env):
-                    return False
+                    if add_flag == '--addfragments':
+                        log.warning('    --addfragments failed/segfaulted on short fragments; falling back to --add')
+                        fallback_cmd = [self.exec_path or 'mafft', '--add', short_fa]
+                        fallback_cmd.extend(['--thread', str(mafft_threads)])
+                        if self.tool_params.get('quiet'):
+                            fallback_cmd.append('--quiet')
+                        fallback_cmd.append(main_aln)
+                        fallback_cmd = self._prepare_cmd(fallback_cmd, cpu_ids=cpu_ids, pin=pin)
+                        if not self._run_to_file(fallback_cmd, combined_aln, env=env):
+                            return False
+                    else:
+                        return False
                 aligned_path = combined_aln
 
             combined = _read_aligned_fasta(aligned_path)
@@ -842,7 +855,7 @@ class ClustalOmega(AlignmentTool):
             process = subprocess.run(
                 cmd,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
                 text=True,
                 check=False,
                 env=dict(child_env) if child_env else self._get_subprocess_env(),
@@ -915,7 +928,7 @@ class MUSCLE(AlignmentTool):
             process = subprocess.run(
                 cmd,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
                 text=True,
                 check=False,
                 env=dict(child_env) if child_env else self._get_subprocess_env(),
@@ -1029,7 +1042,7 @@ class GenericAlignmentTool(AlignmentTool):
             process = subprocess.run(
                 cmd,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
                 text=True,
                 check=False,
                 env=dict(child_env) if child_env else self._get_subprocess_env(),

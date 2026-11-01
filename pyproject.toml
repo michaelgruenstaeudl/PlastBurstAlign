@@ -148,6 +148,7 @@ ignore = [
 #
 #   python -m pytest -o addopts="-v" --cov --cov-report=term --cov-report=xml tests
 [tool.pytest.ini_options]
+pythonpath = [".", "tests"]
 testpaths = ["tests"]
 addopts = "-v -p no:cov"
 

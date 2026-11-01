@@ -180,8 +180,9 @@ class CliFlagTests(unittest.TestCase):
         cls._tmp.cleanup()
 
     def test_version(self) -> None:
+        from contextlib import redirect_stderr
         buf = io.StringIO()
-        with redirect_stdout(buf):
+        with redirect_stdout(buf), redirect_stderr(buf):
             code = main(["--version"])
         self.assertEqual(code, 0)
         self.assertTrue(buf.getvalue().strip())
@@ -193,8 +194,9 @@ class CliFlagTests(unittest.TestCase):
     def test_estimate(self) -> None:
         out = self.root / "est_out"
         out.mkdir(exist_ok=True)
+        from contextlib import redirect_stderr
         buf = io.StringIO()
-        with redirect_stdout(buf):
+        with redirect_stdout(buf), redirect_stderr(buf):
             code = main(
                 [
                     "--inpd",
