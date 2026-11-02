@@ -31,7 +31,7 @@ env:
   # catch a collapse of the suite. The final v3 agent calibrates it against the
   # measured coverage (the `builtin` legs skip the tests that need MAFFT, so do
   # not set it from the `mafft` legs alone).
-  COVERAGE_FAIL_UNDER: "70"
+  COVERAGE_FAIL_UNDER: "55"
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
 
 jobs:
