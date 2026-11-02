@@ -1,0 +1,261 @@
+name: CI
+
+# Triggers
+#   push / pull_request  - every change to main
+#   schedule             - nightly run of the full matrix: catches upstream drift
+#                          (new MAFFT/Biopython/NumPy/Python releases) between PRs
+#   workflow_dispatch    - manual run
+#   workflow_call        - reused by build-and-publish.yaml so that nothing is
+#                          published unless this exact commit passes the suite
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  # Only superseded PR pushes are cancelled; runs on main, nightly runs and the
+  # pre-publish run are never cancelled half-way.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Coverage gate for every test leg. Deliberately conservative: it only has to
+  # catch a collapse of the suite. The final v3 agent calibrates it against the
+  # measured coverage (the `builtin` legs skip the tests that need MAFFT, so do
+  # not set it from the `mafft` legs alone).
+  COVERAGE_FAIL_UNDER: "55"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  lint:
+    name: Lint, format and types
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install the package with the dev tools
+        # The package itself is installed so that mypy resolves the same
+        # third-party types (Biopython, NumPy, ...) as in local development.
+        # ruff and mypy are pinned to one minor series in the `dev` extra, so the
+        # result matches `.pre-commit-config.yaml` and local runs.
+        run: python -m pip install -e ".[dev]"
+
+      - name: Ruff lint
+        run: ruff check .
+
+      - name: Ruff format check
+        run: ruff format --check .
+
+      - name: Mypy (whole package)
+        run: mypy plastburstalign
+
+  test:
+    name: Test (${{ matrix.os }}, py${{ matrix.python-version }}, ${{ matrix.aligner }})
+    needs: lint
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ["3.11", "3.12", "3.13"]
+        # mafft:   real MAFFT + MUSCLE + Clustal Omega installed.
+        # builtin: NO external aligner is installed and the resolver is told to
+        #          ignore any that exist, so the pure-Python fallback aligner is
+        #          what runs (tests that need MAFFT self-skip).
+        aligner: [mafft, builtin]
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+
+      # --- external aligners (mafft legs only) -------------------------------
+      - name: Install MAFFT, MUSCLE and Clustal Omega (Linux, apt)
+        if: runner.os == 'Linux' && matrix.aligner == 'mafft'
+        # Ubuntu 24.04 ships mafft 7.505, muscle 5.1 (the MUSCLE5 CLI with
+        # -super5, binary name `muscle`) and clustalo 1.2.4. Using the older
+        # distro versions here and the newer conda ones on macOS exercises a
+        # range of aligner versions.
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends mafft muscle clustalo
+
+      - name: Set up Miniforge (macOS)
+        if: runner.os == 'macOS' && matrix.aligner == 'mafft'
+        uses: conda-incubator/setup-miniconda@v4
+        with:
+          miniforge-version: latest
+          auto-activate: false
+          activate-environment: ""
+          conda-remove-defaults: "true"
+
+      - name: Install MAFFT, MUSCLE and Clustal Omega (macOS, conda)
+        if: runner.os == 'macOS' && matrix.aligner == 'mafft'
+        # Why conda and not Homebrew on macOS: Homebrew-core only has `mafft`;
+        # `muscle` and `clustal-omega` are not in homebrew-core (they live in the
+        # third-party brewsci/bio tap, which builds from source on new macOS
+        # releases). conda-forge (mafft 7.526) + bioconda (muscle 5.3,
+        # clustalo 1.2.4) all publish osx-arm64 binaries, matching the
+        # `macos-latest` (Apple silicon) runner and the dev environment's MAFFT.
+        # Only the three executables are exposed on PATH (via symlinks) so the
+        # conda env cannot shadow the python that actions/setup-python installs.
+        shell: bash -el {0}
+        run: |
+          conda create -y -n pba-aligners --override-channels \
+            -c conda-forge -c bioconda mafft "muscle>=5" clustalo
+          prefix="$(conda info --base)/envs/pba-aligners"
+          bin_dir="${RUNNER_TEMP}/aligner-bin"
+          mkdir -p "${bin_dir}"
+          for exe in mafft muscle clustalo; do
+            ln -sf "${prefix}/bin/${exe}" "${bin_dir}/${exe}"
+          done
+          echo "${bin_dir}" >> "${GITHUB_PATH}"
+
+      - name: Force the built-in fallback aligner
+        if: matrix.aligner == 'builtin'
+        # Contract with the aligner resolver: when PBA_FORCE_BUILTIN_ALIGNER=1
+        # is set, external aligners (PATH, PBA_MAFFT, conda, modules, ...) are
+        # ignored and the pure-Python fallback aligner is used. Written to
+        # GITHUB_ENV (not a job-level env) so it is absent, not empty, on the
+        # mafft legs.
+        run: echo "PBA_FORCE_BUILTIN_ALIGNER=1" >> "${GITHUB_ENV}"
+
+      # --- Python ---------------------------------------------------------------
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install the package with the test dependencies
+        run: python -m pip install -e ".[test]"
+
+      - name: Report the aligners visible to the tests
+        shell: bash
+        run: |
+          echo "aligner leg: ${{ matrix.aligner }}  PBA_FORCE_BUILTIN_ALIGNER=${PBA_FORCE_BUILTIN_ALIGNER:-<unset>}"
+          missing=0
+          for exe in mafft muscle clustalo; do
+            if command -v "${exe}" > /dev/null; then
+              echo "${exe}: $(command -v "${exe}")"
+            else
+              echo "${exe}: not on PATH"
+              missing=1
+            fi
+          done
+          mafft --version 2>&1 | head -n 1 || true
+          muscle -version 2>&1 | head -n 1 || true
+          clustalo --version 2>&1 | head -n 1 || true
+          if [ "${{ matrix.aligner }}" = "mafft" ] && [ "${missing}" -ne 0 ]; then
+            echo "::error::the mafft leg needs mafft, muscle and clustalo on PATH"
+            exit 1
+          fi
+
+      - name: Run the test suite with coverage
+        # pyproject sets `addopts = "-v -p no:cov"` to keep local runs
+        # coverage-free; `-o addopts="-v"` replaces it here, which re-enables
+        # pytest-cov (a later `-p cov` would not: the plugin is `pytest_cov`).
+        # Worker processes and CLI subprocesses are measured via the
+        # [tool.coverage.run] settings (parallel, multiprocessing, patch).
+        run: >-
+          python -m pytest
+          -o addopts="-v"
+          -p no:cacheprovider
+          --cov
+          --cov-report=term-missing:skip-covered
+          --cov-report=xml:coverage.xml
+          --cov-fail-under="${COVERAGE_FAIL_UNDER}"
+          tests
+
+      - name: Upload the coverage report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-${{ matrix.os }}-py${{ matrix.python-version }}-${{ matrix.aligner }}
+          path: coverage.xml
+          if-no-files-found: ignore
+          retention-days: 14
+
+  package:
+    name: Build and install-test the distribution
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Build the sdist and the wheel
+        run: |
+          python -m pip install build twine
+          python -m build
+
+      - name: Check the distribution metadata
+        run: python -m twine check --strict dist/*
+
+      - name: Install each artifact into a clean venv and smoke-test it
+        shell: bash
+        run: |
+          expected="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          echo "expected version: ${expected}"
+          repo="$(pwd)"
+          # Run from outside the checkout so the source tree cannot shadow the
+          # installed package.
+          cd "${RUNNER_TEMP}"
+          for kind in wheel sdist; do
+            python -m venv "venv-${kind}"
+            if [ "${kind}" = "wheel" ]; then
+              "venv-${kind}/bin/python" -m pip install --quiet "${repo}"/dist/*.whl
+            else
+              "venv-${kind}/bin/python" -m pip install --quiet "${repo}"/dist/*.tar.gz
+            fi
+            version="$("venv-${kind}/bin/python" -c 'import plastburstalign as pba; print(pba.__version__)')"
+            echo "${kind}: plastburstalign ${version}"
+            test "${version}" = "${expected}"
+            "venv-${kind}/bin/plastburstalign" --help > /dev/null
+            "venv-${kind}/bin/pba" --help > /dev/null
+          done
+
+      - name: Upload the distribution for inspection
+        uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
+          retention-days: 7
+
+  ci-success:
+    # Single required check for branch protection: it is green only if every
+    # matrix leg of every job is green (a skipped dependency counts as failure).
+    name: CI passed
+    if: ${{ always() }}
+    needs: [lint, test, package]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Evaluate the job results
+        run: |
+          echo "lint=${{ needs.lint.result }} test=${{ needs.test.result }} package=${{ needs.package.result }}"
+          test "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped') }}" = "false"
