@@ -1,8 +1,8 @@
 import os
 from collections import OrderedDict, defaultdict
-from re import findall, match, sub
+from re import IGNORECASE, findall, match, sub
 from typing import Any, ClassVar, Optional
-
+import re
 from Bio import SeqUtils
 from Bio.Data import CodonTable
 from Bio.Seq import Seq
@@ -229,52 +229,71 @@ class GeneNameCleaner:
         """
         Standardizes a tRNA gene name by case, delimiter usage, and anticodon.
         If there is no initial gene name (`None`), `None` will be returned.
-
-        Args:
-            gene: Gene name.
-            cut_trna: Option to disregard additional qualifiers from the name (default is `False`).
-
-        Returns:
-            Cleaned gene name.
-
         """
         if not gene:
             return None
 
-        # look for standardized gene name
+        gene = gene.strip()
+
+        # Handle tRNA names with an attached anticodon:
+        # trnVUAC -> trnV_UAC
+        # trnVTAC -> trnV_UAC
+        attached_anticodon = match(
+            r"^(trn[A-Za-z])([ACGTUacgtu]{3})$",
+            gene,
+            flags=IGNORECASE
+        )
+
+        if attached_anticodon:
+            base_gene = (
+                "trn" + attached_anticodon.group(1)[3].upper()
+            )
+            anticodon = (
+                attached_anticodon.group(2).upper().replace("T", "U")
+            )
+            return base_gene if cut_trna else f"{base_gene}_{anticodon}"
+
+        # Look for standardized gene name
         gene_pattern = r"^[a-zA-Z]{3}[a-zA-Z0-9]+"
         gene_sub = match(gene_pattern, gene)
-        # if non-standard, just return a "safe" version of the name
+
         if not gene_sub:
             return sub(r"\W+", "_", gene.replace("-", "_"))
-        # the first match is the beginning of the cleaned name
-        cleaned_gene = gene_sub.group()[0:3].lower() + gene_sub.group()[3:].upper()
+
+        cleaned_gene = (
+            gene_sub.group()[0:3].lower()
+            + gene_sub.group()[3:].upper()
+        )
+
         if cut_trna:
             return cleaned_gene
 
-        # look for tRNA qualifiers
-        gene = gene[len(cleaned_gene) :]
+        # Look for tRNA qualifiers
+        gene = gene[len(gene_sub.group()):]
         trna_pattern = r"([a-zA-Z]{3})"
         qual_subs = findall(trna_pattern, gene)
-        # if not tRNA, return the gene
+
         if not qual_subs:
             return cleaned_gene
 
-        # handle each tRNA qualifier appropriately
-        codon_pattern = r"\b[ACGTUacgtu]{3}\b"
+        # Handle each tRNA qualifier
+        codon_pattern = r"^[ACGTUacgtu]{3}$"
         anticodon = None
+
         while not anticodon and qual_subs:
             qualifier = qual_subs.pop()
-            # qualifier is codon
+
             if match(codon_pattern, qualifier):
-                anticodon = qualifier.upper()
-            # qualifier is amino acid?
+                anticodon = qualifier.upper().replace("T", "U")
             else:
                 anticodon = self._amino3_to_anticodon(qualifier)
+                if anticodon:
+                    anticodon = anticodon.upper().replace("T", "U")
+
         if anticodon:
             cleaned_gene += "_" + anticodon
-        return cleaned_gene
 
+        return cleaned_gene
     def clean_rrna_gene(self, gene: Optional[str]) -> Optional[str]:
         """Standardizes recognized plastid rRNA names to their canonical gene names."""
         if not gene:
