@@ -243,28 +243,34 @@ class ExtractAndCollect:
 
     def _extract_rna(self, rec: SeqRecord, nuc_dict: PlastidDict):
         """
-        Extracts annotated tRNA and rRNA sequences without reading-frame checks or translation.
+        Extracts enabled annotated tRNA and/or rRNA sequences without reading-frame checks or translation.
         """
+        enabled_types = set()
+        if self.include_trna:
+            enabled_types.add("tRNA")
+        if self.include_rrna:
+            enabled_types.add("rRNA")
+
         for feature in RecordFeatures(rec, self.exclude_cds).rna_feats:
-            if (feature.type == "tRNA" and self.include_trna) or (
-                feature.type == "rRNA" and self.include_rrna
-            ):
-                if len(feature.location) < self.min_seq_length:
-                    continue
-                feat_name = PlastidFeature.name_cleaner.get_safe_gene(feature)
-                if self._is_region_excluded(feat_name):
-                    continue
+            if feature.type not in enabled_types:
+                # print(f"Skipping {feature.type} feature {PlastidFeature.name_cleaner.get_safe_gene(feature)} in {rec.name} because it is not enabled.")
+                continue
+            if len(feature.location) < self.min_seq_length:
+                continue
+            feat_name = PlastidFeature.name_cleaner.get_safe_gene(feature)
+            if self._is_region_excluded(feat_name):
+                continue
 
-                feat = PlastidFeature(rec, feature)
-                if feat.seq_obj is None:
-                    nuc_dict.add_feature(feat)
-                    continue
-                if len(feat.seq_obj) < self.min_seq_length or self._is_region_excluded(
-                    feat.feat_name
-                ):
-                    continue
-
+            feat = PlastidFeature(rec, feature)
+            if feat.seq_obj is None:
                 nuc_dict.add_feature(feat)
+                continue
+            if len(feat.seq_obj) < self.min_seq_length or self._is_region_excluded(
+                feat.feat_name
+            ):
+                continue
+
+            nuc_dict.add_feature(feat)
 
     def _extract_igs(self, rec: SeqRecord, nuc_dict: PlastidDict):
         """
