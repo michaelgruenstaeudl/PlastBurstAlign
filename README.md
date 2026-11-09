@@ -131,8 +131,8 @@ python benchmarking_IGS.py benchmark_YangEtAl2022_Asteraceae 5
 | `-l` | Minimum sequence length (bp); regions shorter than this are excluded| `-l 9` |
 | `-t` | Minimum number of taxa (int) or relative frequency (0<value<=1) in which a region must be present to be extracted | `-t 0.1` |
 | `-n` | Number of threads to use| `-n 8` |
-| `--no-trna` | Disable tRNAs in `rna` mode (default: enabled) | `--no-trna` |
-| `--no-rrna` | Disable rRNAs in `rna` mode (default: enabled) | `--no-rrna` |
+| `--trna` | Enable tRNAs in `rna` mode (default: disabled) | `--no-trna` |
+| `--rrna` | Enable rRNAs in `rna` mode (default: disabled) | `--no-rrna` |
 | `--config` | Path to YAML config file containing parameters | `--config config.yaml` |
 
 ---
@@ -143,16 +143,16 @@ Use `-s rna` (or `select_mode: "rna"` in a YAML configuration) to extract annota
 `tRNA` and `rRNA` features and align them directly as DNA nucleotide sequences:
 
 ```bash
-plastburstalign -i Input_dataset -o Output_RNA -s rna -a mafft
+plastburstalign -i Input_dataset -o Output_RNA -s rna --trna --rrna -a mafft
 ```
 
-Both RNA types are enabled by default. Select only one type with:
+Both RNA types are disabled by default. Select only one type with:
 
 ```bash
 # tRNAs only
-plastburstalign -i Input_dataset -o Output_tRNA -s rna --no-rrna -a mafft
+plastburstalign -i Input_dataset -o Output_tRNA -s rna --trna -a mafft
 # rRNAs only
-plastburstalign -i Input_dataset -o Output_rRNA -s rna --no-trna -a mafft
+plastburstalign -i Input_dataset -o Output_rRNA -s rna --rrna -a mafft
 ```
 
 The equivalent YAML and Python API parameters are `include_trna` and `include_rrna`
