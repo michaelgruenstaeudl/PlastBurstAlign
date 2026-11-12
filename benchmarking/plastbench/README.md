@@ -208,7 +208,7 @@ This requires a Zenodo account and cannot be automated from this repository.
 5. Run `python benchmarking/plastbench/plastbench.py list` and
    `python -m pytest -q tests/test_plastbench.py`; the manifest validator
    rejects missing checksums, unknown tiers and inconsistent statuses.
-6. Mention the new dataset in `CHANGELOG.md`. Software releases are archived
+6. Software releases are archived
    separately through the Zenodo-GitHub integration (see `.zenodo.json` and
    `CITATION.cff` at the repository root).
 

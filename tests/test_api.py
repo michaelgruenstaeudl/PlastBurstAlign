@@ -206,7 +206,7 @@ class CliFlagTests(unittest.TestCase):
                     "--outd",
                     str(out),
                     "--selectmode",
-                    "rna",
+                    "rna", "--trna", "--rrna",
                     "--numthreads",
                     "2",
                     "--estimate",
@@ -239,7 +239,7 @@ class CliFlagTests(unittest.TestCase):
                     "--outd",
                     str(out),
                     "--selectmode",
-                    "rna",
+                    "rna", "--trna", "--rrna",
                     "--numthreads",
                     "2",
                     "--no-dashboard",
@@ -263,7 +263,7 @@ class SinkWiringTests(unittest.TestCase):
             sink = NullSink()
             result = align(
                 manifest.out_dir,
-                mode="rna",
+                mode="rna", include_trna=True, include_rrna=True,
                 out_dir=root / "out",
                 num_threads=2,
                 dashboard="off",

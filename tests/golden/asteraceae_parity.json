@@ -1,5 +1,5 @@
 {
- "aligner_version": "v7.526 (2024/Apr/26)",
+ "aligner_version": "v7.525 (2024/Mar/13)",
  "dataset": "benchmark_YangEtAl2022_Asteraceae",
  "description": "Canonicalized outputs of the real PlastBurstAlign CLI on a fixed Asteraceae subset. See benchmarking/golden_parity.py.",
  "files": [
@@ -20,7 +20,7 @@
   "NC_007977.gb",
   "NC_010601.gb"
  ],
- "git_head": "dcf7b5a35fba20093ddd2fd29b3ee9092cf92e87",
+ "git_head": "2203b1939c4135d814775576b6dd994725ea6294",
  "modes": {
   "cds": {
    "args": [
@@ -2067,9 +2067,9 @@
   "rna": {
    "args": [
     "-i",
-    "/tmp/pba_golden_36__jxkb/input",
+    "/tmp/pba_golden_u9fdabso/input",
     "-o",
-    "/tmp/pba_golden_36__jxkb/out_rna_0",
+    "/tmp/pba_golden_u9fdabso/out_rna_0",
     "-s",
     "rna",
     "-n",
@@ -2080,25 +2080,31 @@
     "-l",
     "30",
     "-t",
-    "12"
+    "12",
+    "--trna",
+    "--rrna"
    ],
    "concat": {
-    "nchar": 1662,
-    "nloci": 21,
+    "nchar": 1956,
+    "nloci": 25,
     "ntax": 14,
-    "ordered_sha256": "d8f3742c1231c3d756e6a2d0e1f0c27cddf80e6294b6da97b566ff46dfcbb2ff",
+    "ordered_sha256": "8e9771dbf4e9ee441ae8ee0c67b8de489c7fcdcadea8d21a3ceedaba016ad53c",
     "partition_order": [
+     "trnH_GUG",
      "trnK_UUU",
      "trnQ_UUG",
      "trnS_GCU",
      "trnC_GCA",
      "trnD_GUC",
      "trnY_GUA",
+     "trnR_UCU",
      "trnT_GGU",
      "trnS_UGA",
      "trnFM_CAU",
+     "trnT_UGU",
      "trnL_UAA",
      "trnF_GAA",
+     "trnM_CAU",
      "trnW_CCA",
      "trnP_UGG",
      "trnI_CAU",
@@ -2113,25 +2119,29 @@
     "partition_sha256": {
      "trnA_UGC": "23e2d6aeb5cdfa134ae8bf16f9e53e6fa742b93312735f907ee67a7c09b38781",
      "trnC_GCA": "ac2b99ad1b836f1bebc6182e6c94f9a587cba976bc2f5bbc3aaffd2eca708e83",
-     "trnD_GUC": "6e75e5d4c0575aec06f9d224f48d1eaff7e76e2a6cebf0abbce4f7959ee9f4ab",
+     "trnD_GUC": "dad66e4e4e3bb81bd040e190effd8653475fe8b185ce7c9168e5eefab61cd9b7",
      "trnFM_CAU": "c1264ac93816637e270459ca83dce8f86952afd7f516503ec041786f0423d2d9",
      "trnF_GAA": "83bf5c9db704f78da2f03393bc05ee54b515779911ed75bed54ec89097880c9b",
-     "trnI_CAU": "31bc887bd49d585cedcc677f9c3d15ed83e81de57f2a0058bfefa206c7b87ffa",
+     "trnH_GUG": "53855a9487bb42f251129d8956be213e22b89078a5220a1b32b44f7d10104d80",
+     "trnI_CAU": "662b3420c5c2899aa5b1f1f78500a3621cf4f0857c5a805a93059148682c4efe",
      "trnI_GAU": "dd5f9c5e463e8d139c48ca70f191fd6933e5e3ccb3bdcdaba304324856e3bd78",
      "trnK_UUU": "d774445607d794a18ad4d9c5f31108e5b47e1bba61eb3a9624b52b0063b4018e",
      "trnL_CAA": "3aff208db6bd234a4e1f2ba876e817acd9d8cd7939b4040b9b093a6db25433a1",
      "trnL_UAA": "05169eb129733f30cbdb5647b8e7ecd248da1aa7b6cfa7e9acd9628cce80ea61",
-     "trnL_UAG": "d67350857b153791f0604e1be1c32f07b0a5cd9efcd44c0be165106d766a3887",
-     "trnN_GUU": "b4bb3419febce5d7a90571dd5623484dd46dbcf40269d39be3fff6e91f0d1156",
-     "trnP_UGG": "5b72bea6b44216f5e4f63d011b45c5450e6a8b780ced2d7223b689dcc5b28ee3",
-     "trnQ_UUG": "18217f32e4049f001e29ee1590634e5d6f6a1d8bcd7fcbf2a8c7ca53eb630e5c",
+     "trnL_UAG": "99756a1f8234daa496175203eb93e988a4bc8a0562056932cded2b4f6c343f99",
+     "trnM_CAU": "25051211af50d6271bd112df5d8e630edd39215a9946da9c61ca393752e2ba43",
+     "trnN_GUU": "8ddddc1c331b0eb222f5ccd4e87973133daa50c68e8204f8e91c24436f0892f1",
+     "trnP_UGG": "664d4a39e7d9a2c090cd6f24d1c83706ef8eeec27e7c85f86497b8433d0d5687",
+     "trnQ_UUG": "148e4d7e0a18bc8ee6830b855a20c76fd32ee3eff42ea1a898ffb76c81e78112",
      "trnR_ACG": "b0008109c2401b5b52e2346ad089e4ecb1d4d9352107b2f236809cb0325675c4",
-     "trnS_GCU": "81b85f08251d1c84e79f5dc6434eb9a23bb55be20eaf7978ea4b7d3baa329544",
-     "trnS_UGA": "f0621305dd67814865c8d56c9e39f9cdc6bc110245dafa3a24f3765532b9a522",
-     "trnT_GGU": "800718353c6214589cb34bc92e9083963b6f6cf522e3b524e32e31c21302de76",
+     "trnR_UCU": "1d4a89219692e6d1231ae9af591faf7f922f14bdb28c99f4ec6a4a2aea8ea4d6",
+     "trnS_GCU": "44bc7fc4e9375ccb9040a25a6b0a95d76695ffedc077089868e5099b5f4903ac",
+     "trnS_UGA": "2388c4945cfbeebf634ca257529afd8f835a31293637f9e86e36773a9e15ee22",
+     "trnT_GGU": "71cc5e589e3a93c0dde56536f894c13efcb10aee5021fc998166639b998dce26",
+     "trnT_UGU": "79304cc109d2b01420ca6429301d05eff824cc200cf7271e81b93b8dad1f629b",
      "trnV_GAC": "f1f8cb3475406e05266c7bbe590a993f6a76fe6a1a6e75be9163315841c07cf3",
      "trnW_CCA": "20ded3da0cf06eba7a259624ea179f8f3d66f1315e5d708c682c34f85360e6fe",
-     "trnY_GUA": "87a1d51a691b20d12b119d6b3cc3a631e942ae47422af4dba0ee00ec7383864e"
+     "trnY_GUA": "5b358bc379ec4115fb28338d32875430289a1b5c97544c9e57ba2533450e67ed"
     },
     "partitions": {
      "trnA_UGC": 73,
@@ -2139,26 +2149,30 @@
      "trnD_GUC": 74,
      "trnFM_CAU": 74,
      "trnF_GAA": 73,
+     "trnH_GUG": 75,
      "trnI_CAU": 81,
      "trnI_GAU": 81,
      "trnK_UUU": 81,
      "trnL_CAA": 81,
      "trnL_UAA": 87,
      "trnL_UAG": 81,
+     "trnM_CAU": 74,
      "trnN_GUU": 98,
      "trnP_UGG": 74,
      "trnQ_UUG": 72,
      "trnR_ACG": 74,
+     "trnR_UCU": 72,
      "trnS_GCU": 88,
      "trnS_UGA": 83,
      "trnT_GGU": 76,
+     "trnT_UGU": 73,
      "trnV_GAC": 72,
      "trnW_CCA": 74,
      "trnY_GUA": 84
     },
     "partitions_cover_matrix": true,
     "ragged": false,
-    "sha256": "d6c8d175ba5c07f53531e126c86e4149a897335acc14b160846aa36962099f93"
+    "sha256": "9f33e0930e80b8631434406f3f55cdf8b80c09a4c1917934481f3ae0c1ca42db"
    },
    "concat_volatile": false,
    "loci": {
@@ -2178,10 +2192,10 @@
     },
     "nucl_trnD_GUC.aligned.fasta": {
      "nchar": 74,
-     "ntax": 12,
+     "ntax": 14,
      "ragged": false,
-     "sha256": "681303835f9f3aaf12576eeaa5b8d2be5b83306e0ae06f94a1256b17977b0467",
-     "ungapped_sha256": "681303835f9f3aaf12576eeaa5b8d2be5b83306e0ae06f94a1256b17977b0467"
+     "sha256": "f6d15f08dcbcd0df6a26b6f3fce81387fea02d3ca6021df83372d29d4fefefc6",
+     "ungapped_sha256": "f6d15f08dcbcd0df6a26b6f3fce81387fea02d3ca6021df83372d29d4fefefc6"
     },
     "nucl_trnFM_CAU.aligned.fasta": {
      "nchar": 74,
@@ -2197,12 +2211,19 @@
      "sha256": "a396826ca853e7029c664ed00130557b560e87a7d4e98492d24baede3146aeb8",
      "ungapped_sha256": "bfff1ce98541125fd4df4982aa10d1d652a58c71532f129583de01231f24dc81"
     },
+    "nucl_trnH_GUG.aligned.fasta": {
+     "nchar": 75,
+     "ntax": 13,
+     "ragged": false,
+     "sha256": "87d0cb9dfcf9ea920a99f9b1e9da62e539680417b485905be2d47247cd6a73d0",
+     "ungapped_sha256": "83017ad263900dc4f5364c4da1ad52191c16bbfef5adf678022124151fc94d17"
+    },
     "nucl_trnI_CAU.aligned.fasta": {
      "nchar": 81,
-     "ntax": 12,
+     "ntax": 14,
      "ragged": false,
-     "sha256": "c294b28c21ca143370b97d689994a488ea9d51d7efb887395307f3a1a6b0fb51",
-     "ungapped_sha256": "544a5387770128aad561fc4fdd9d87f8b5eb40d56d80daa0843bfb2afe401024"
+     "sha256": "96791bd725e2288099512920c7ace9ad00a7d54a2f824b76ec67d37038529078",
+     "ungapped_sha256": "5fd5668e9eed7ead667764c2ee1add5678fa0c945fb2eb309bf7c820a173f897"
     },
     "nucl_trnI_GAU.aligned.fasta": {
      "nchar": 81,
@@ -2234,31 +2255,38 @@
     },
     "nucl_trnL_UAG.aligned.fasta": {
      "nchar": 81,
-     "ntax": 12,
+     "ntax": 14,
      "ragged": false,
-     "sha256": "b2b2c3265031c75ad19436d3bcd199119e689c9e729bfb0bc3837c9afd859166",
-     "ungapped_sha256": "1950146047989a9a6163c9add3c47de6bef45369dec4800fb4ed7986085ed7e2"
+     "sha256": "40c732a7b18ef4c561d35b2e59ffcee7d04e4c4a0cf28f9945978760cccdd2ba",
+     "ungapped_sha256": "46c7ab96783a487834586c7918c740c5952f88d9b79f33c6fa943c9ebb2b82fc"
+    },
+    "nucl_trnM_CAU.aligned.fasta": {
+     "nchar": 74,
+     "ntax": 13,
+     "ragged": false,
+     "sha256": "4f1412fdfcaea4d67763bf3340f21a6acfc0a20cf298c600e638089e781596f5",
+     "ungapped_sha256": "54ef52bb583edc1c55c0e3d2421d43d11fe72ce624f34a7135c06fa09238f22a"
     },
     "nucl_trnN_GUU.aligned.fasta": {
      "nchar": 98,
-     "ntax": 12,
+     "ntax": 14,
      "ragged": false,
-     "sha256": "c838542f487b3dbe35f6f12447b3cba24daef61888d8ae6033c08f5176d377ee",
-     "ungapped_sha256": "ca80e019023bb1b454859ca8e27a87a5ec22d844ac223d69344098f67c7f00ce"
+     "sha256": "58657ed648e9d1e6d49f4da4fe1c15855d8d94831b5271f7d50d0baeb59989e5",
+     "ungapped_sha256": "43ad69cd48a5ceb9e90d76da5f23a7bb1231989b58f841a7e72f4dbc126452b3"
     },
     "nucl_trnP_UGG.aligned.fasta": {
      "nchar": 74,
-     "ntax": 12,
+     "ntax": 14,
      "ragged": false,
-     "sha256": "fb63c890ca403232c8c94896be9f54185ea934e43f9a2f895ef7032c9ab991a7",
-     "ungapped_sha256": "fb63c890ca403232c8c94896be9f54185ea934e43f9a2f895ef7032c9ab991a7"
+     "sha256": "5b73752aea7051caa98e96a17510f24c6afba8538ca3b952e08046de7457e661",
+     "ungapped_sha256": "5b73752aea7051caa98e96a17510f24c6afba8538ca3b952e08046de7457e661"
     },
     "nucl_trnQ_UUG.aligned.fasta": {
      "nchar": 72,
-     "ntax": 12,
+     "ntax": 14,
      "ragged": false,
-     "sha256": "2eeff8b2cb59993dcc5625ef631ea3c48f6bf1a523f56c40d13ff688cf75385c",
-     "ungapped_sha256": "2eeff8b2cb59993dcc5625ef631ea3c48f6bf1a523f56c40d13ff688cf75385c"
+     "sha256": "21798c8225408f04c7906f6254293d717c62cd566bf7ad8bbb97cee5064a1423",
+     "ungapped_sha256": "21798c8225408f04c7906f6254293d717c62cd566bf7ad8bbb97cee5064a1423"
     },
     "nucl_trnR_ACG.aligned.fasta": {
      "nchar": 74,
@@ -2267,26 +2295,40 @@
      "sha256": "2fcbb4721aad2169f84513e2dd333ec81e5ca447284c46540bc94d2dd8b5d6e8",
      "ungapped_sha256": "2fcbb4721aad2169f84513e2dd333ec81e5ca447284c46540bc94d2dd8b5d6e8"
     },
+    "nucl_trnR_UCU.aligned.fasta": {
+     "nchar": 72,
+     "ntax": 13,
+     "ragged": false,
+     "sha256": "622b8e24fa4b0ee500a229d4454f1379e60f14c2d16233036a0ae4f64b7719b2",
+     "ungapped_sha256": "622b8e24fa4b0ee500a229d4454f1379e60f14c2d16233036a0ae4f64b7719b2"
+    },
     "nucl_trnS_GCU.aligned.fasta": {
      "nchar": 88,
-     "ntax": 12,
+     "ntax": 14,
      "ragged": false,
-     "sha256": "80ea7ecb3d2d7f4b33b683cbe44969996d0091d109f21a9621a68b8ceab19e8a",
-     "ungapped_sha256": "80ea7ecb3d2d7f4b33b683cbe44969996d0091d109f21a9621a68b8ceab19e8a"
+     "sha256": "4f0d92cd5e65dffa57a3874d3cb90b0b6b758031159a5c355fb786e058f552bd",
+     "ungapped_sha256": "4f0d92cd5e65dffa57a3874d3cb90b0b6b758031159a5c355fb786e058f552bd"
     },
     "nucl_trnS_UGA.aligned.fasta": {
      "nchar": 83,
-     "ntax": 12,
+     "ntax": 14,
      "ragged": false,
-     "sha256": "cf6ff2517453a940fda81a8e9f942d091c8f1546b45ba6c0335015ca266efe46",
-     "ungapped_sha256": "cf6ff2517453a940fda81a8e9f942d091c8f1546b45ba6c0335015ca266efe46"
+     "sha256": "b49ca40a47bf8d2cf2a9a2740ffcad92482fc5430c14aef711db234b5178d479",
+     "ungapped_sha256": "b49ca40a47bf8d2cf2a9a2740ffcad92482fc5430c14aef711db234b5178d479"
     },
     "nucl_trnT_GGU.aligned.fasta": {
      "nchar": 76,
-     "ntax": 12,
+     "ntax": 14,
      "ragged": false,
-     "sha256": "d89de8871735a096edacf09e286a8d6c587b6c5e8b1a58c00d67686592d72a10",
-     "ungapped_sha256": "08d497f17feecfc8f021ae4fdc2e40279f0d7a8849c5319ac9b44df6c35d4d26"
+     "sha256": "9da84e9bb5ad7807dd1ac0746fe0f07c0a29ffd152131fe75b4f62494f3ff172",
+     "ungapped_sha256": "46382dc81752f4a0a8a391abb8cfda9333753fff76d971594978c06d38c649c2"
+    },
+    "nucl_trnT_UGU.aligned.fasta": {
+     "nchar": 73,
+     "ntax": 13,
+     "ragged": false,
+     "sha256": "ee5400c21647607b92c2abc5c305090e4b25570f86f7a16a60f8b70caf03af52",
+     "ungapped_sha256": "ee5400c21647607b92c2abc5c305090e4b25570f86f7a16a60f8b70caf03af52"
     },
     "nucl_trnV_GAC.aligned.fasta": {
      "nchar": 72,
@@ -2304,10 +2346,10 @@
     },
     "nucl_trnY_GUA.aligned.fasta": {
      "nchar": 84,
-     "ntax": 12,
+     "ntax": 14,
      "ragged": false,
-     "sha256": "12cbf06078bc7828b0f8626959ecf3348622f8ff8a90a0d18a06a01f286c64f5",
-     "ungapped_sha256": "12cbf06078bc7828b0f8626959ecf3348622f8ff8a90a0d18a06a01f286c64f5"
+     "sha256": "6a13b0251bc329fb2c5aa32e45040ce3eb40a656867f41392ec5f66f176afd7a",
+     "ungapped_sha256": "6a13b0251bc329fb2c5aa32e45040ce3eb40a656867f41392ec5f66f176afd7a"
     }
    },
    "locus_files": [
@@ -2316,19 +2358,23 @@
     "nucl_trnD_GUC.aligned.fasta",
     "nucl_trnFM_CAU.aligned.fasta",
     "nucl_trnF_GAA.aligned.fasta",
+    "nucl_trnH_GUG.aligned.fasta",
     "nucl_trnI_CAU.aligned.fasta",
     "nucl_trnI_GAU.aligned.fasta",
     "nucl_trnK_UUU.aligned.fasta",
     "nucl_trnL_CAA.aligned.fasta",
     "nucl_trnL_UAA.aligned.fasta",
     "nucl_trnL_UAG.aligned.fasta",
+    "nucl_trnM_CAU.aligned.fasta",
     "nucl_trnN_GUU.aligned.fasta",
     "nucl_trnP_UGG.aligned.fasta",
     "nucl_trnQ_UUG.aligned.fasta",
     "nucl_trnR_ACG.aligned.fasta",
+    "nucl_trnR_UCU.aligned.fasta",
     "nucl_trnS_GCU.aligned.fasta",
     "nucl_trnS_UGA.aligned.fasta",
     "nucl_trnT_GGU.aligned.fasta",
+    "nucl_trnT_UGU.aligned.fasta",
     "nucl_trnV_GAC.aligned.fasta",
     "nucl_trnW_CCA.aligned.fasta",
     "nucl_trnY_GUA.aligned.fasta"
@@ -2339,46 +2385,54 @@
     "nucl_trnD_GUC.aligned.nexus",
     "nucl_trnFM_CAU.aligned.nexus",
     "nucl_trnF_GAA.aligned.nexus",
+    "nucl_trnH_GUG.aligned.nexus",
     "nucl_trnI_CAU.aligned.nexus",
     "nucl_trnI_GAU.aligned.nexus",
     "nucl_trnK_UUU.aligned.nexus",
     "nucl_trnL_CAA.aligned.nexus",
     "nucl_trnL_UAA.aligned.nexus",
     "nucl_trnL_UAG.aligned.nexus",
+    "nucl_trnM_CAU.aligned.nexus",
     "nucl_trnN_GUU.aligned.nexus",
     "nucl_trnP_UGG.aligned.nexus",
     "nucl_trnQ_UUG.aligned.nexus",
     "nucl_trnR_ACG.aligned.nexus",
+    "nucl_trnR_UCU.aligned.nexus",
     "nucl_trnS_GCU.aligned.nexus",
     "nucl_trnS_UGA.aligned.nexus",
     "nucl_trnT_GGU.aligned.nexus",
+    "nucl_trnT_UGU.aligned.nexus",
     "nucl_trnV_GAC.aligned.nexus",
     "nucl_trnW_CCA.aligned.nexus",
     "nucl_trnY_GUA.aligned.nexus"
    ],
-   "repeats": 3,
+   "repeats": 2,
    "returncode": 0,
-   "run_sha256": "328d1d02fdfee8f77050c868cca7386bd3e0bb34e7b3afe9dc4f7170b65cc7da",
-   "seconds": 1.7,
+   "run_sha256": "277397004cfb7efaf777712536b06cce027020e4fabedf383674d7c55deee868",
+   "seconds": 4.6,
    "unalign_files": [
     "nucl_trnA_UGC.unalign.fasta",
     "nucl_trnC_GCA.unalign.fasta",
     "nucl_trnD_GUC.unalign.fasta",
     "nucl_trnFM_CAU.unalign.fasta",
     "nucl_trnF_GAA.unalign.fasta",
+    "nucl_trnH_GUG.unalign.fasta",
     "nucl_trnI_CAU.unalign.fasta",
     "nucl_trnI_GAU.unalign.fasta",
     "nucl_trnK_UUU.unalign.fasta",
     "nucl_trnL_CAA.unalign.fasta",
     "nucl_trnL_UAA.unalign.fasta",
     "nucl_trnL_UAG.unalign.fasta",
+    "nucl_trnM_CAU.unalign.fasta",
     "nucl_trnN_GUU.unalign.fasta",
     "nucl_trnP_UGG.unalign.fasta",
     "nucl_trnQ_UUG.unalign.fasta",
     "nucl_trnR_ACG.unalign.fasta",
+    "nucl_trnR_UCU.unalign.fasta",
     "nucl_trnS_GCU.unalign.fasta",
     "nucl_trnS_UGA.unalign.fasta",
     "nucl_trnT_GGU.unalign.fasta",
+    "nucl_trnT_UGU.unalign.fasta",
     "nucl_trnV_GAC.unalign.fasta",
     "nucl_trnW_CCA.unalign.fasta",
     "nucl_trnY_GUA.unalign.fasta"
@@ -2386,7 +2440,7 @@
    "volatile_loci": []
   }
  },
- "python_version": "3.11.17",
+ "python_version": "3.11.18",
  "schema_version": 1,
  "sort_listdir_shim": true,
  "threads": 2

@@ -112,7 +112,7 @@ plastburstalign --doctor
 
 See `plastburstalign --help` and [docs/exemplary_usage.md](docs/exemplary_usage.md).
 
-Modes: `cds` (protein-guided), `int`, `igs`, `rna` (tRNA+rRNA; use `--no-trna` / `--no-rrna` to restrict).
+Modes: `cds` (protein-guided), `int`, `igs`, `rna` (pass `--trna` and/or `--rrna`; both disabled by default).
 
 ---
 
@@ -200,4 +200,4 @@ mypy plastburstalign
 python -m pytest -q tests
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md), [CHANGELOG.md](CHANGELOG.md), and [CITATION.cff](CITATION.cff). License: BSD-3-Clause ([LICENSE](LICENSE)).
+See [CONTRIBUTING.md](CONTRIBUTING.md), and [CITATION.cff](CITATION.cff). License: BSD-3-Clause ([LICENSE](LICENSE)).

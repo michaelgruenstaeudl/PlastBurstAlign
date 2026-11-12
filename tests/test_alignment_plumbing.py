@@ -97,7 +97,7 @@ class AlignmentFixtureMixin:
         params = UserParameters(
             in_dir=str(in_dir),
             out_dir=str(self.root / "out"),
-            select_mode=mode,
+            select_mode=mode, include_trna=True, include_rrna=True,
             num_threads=threads,
             min_seq_length=1,
             **kwargs,

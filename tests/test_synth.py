@@ -94,7 +94,7 @@ class SynthPlastomeTests(unittest.TestCase):
                 params = UserParameters(
                     in_dir=str(self.manifest.out_dir),
                     out_dir=str(out_dir),
-                    select_mode=mode,
+                    select_mode=mode, include_trna=True, include_rrna=True,
                     num_threads=2,
                     min_seq_length=3,
                     min_num_taxa=1,

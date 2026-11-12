@@ -416,7 +416,7 @@ class SlurmCommandLineEndToEndTests(unittest.TestCase):
         return proc
 
     def _run_both(self, mode: str) -> tuple[Path, Path]:
-        common = ["-s", mode, "-l", "10", "-t", "3", "-n", "2"]
+        common = ["-s", mode, "--trna", "--rrna", "-l", "10", "-t", "3", "-n", "2"]
         mono = self.root / f"{mode}_mono"
         self._cli(["-i", str(self.in_dir), "-o", str(mono), "-c", *common], self.root)
 

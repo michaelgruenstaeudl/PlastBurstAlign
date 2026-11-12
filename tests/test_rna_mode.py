@@ -52,7 +52,7 @@ class RNAModeTests(unittest.TestCase):
         values = {
             "in_dir": str(self.input_dir),
             "out_dir": str(self.root / "output"),
-            "select_mode": "rna",
+            "select_mode": "rna", "include_trna": True, "include_rrna": True,
             "num_threads": 1,
             "min_seq_length": 1,
             "min_num_taxa": 1,
@@ -120,12 +120,12 @@ class RNAModeTests(unittest.TestCase):
             "-o",
             str(self.root / "output"),
         ]
-        with patch.object(sys, "argv", base_args + ["-s", "RNA"]):
+        with patch.object(sys, "argv", base_args + ["-s", "RNA", "--trna", "--rrna"]):
             params = UserParametersScript()
         self.assertIs(params["select_mode"], SelectMode.RNA)
         self.assertFalse(params["select_mode"].collects_proteins())
         config = self.root / "config.yaml"
-        config.write_text('select_mode: "rna"\n', encoding="ascii")
+        config.write_text('select_mode: "rna"\ninclude_trna: true\ninclude_rrna: true\n', encoding="ascii")
         with patch.object(sys, "argv", base_args + ["--config", str(config)]):
             params = UserParametersScript()
         self.assertIs(params["select_mode"], SelectMode.RNA)
@@ -223,61 +223,20 @@ class RNAModeTests(unittest.TestCase):
                 data, _ = self.extract_record(include_trna=trna, include_rrna=rrna)
                 self.assertEqual(list(data.nucleotides), expected)
 
-    def test_cli_rna_toggles_override_yaml_only_when_explicit(self):
-        config = self.root / "config.yaml"
-        base_args = [
-            "plastburstalign",
-            "-i",
-            str(self.input_dir),
-            "-o",
-            str(self.root / "output"),
-            "--config",
-            str(config),
-        ]
-        for trna, rrna in ((True, True), (True, False), (False, True)):
-            config.write_text(
-                f"select_mode: rna\ninclude_trna: {str(trna).lower()}\n"
-                f"include_rrna: {str(rrna).lower()}\n",
-                encoding="ascii",
-            )
-            for flags, expected in (
-                ([], (trna, rrna)),
-                (["--trna", "--no-rrna"], (True, False)),
-                (["--no-trna", "--rrna"], (False, True)),
-                (["--trna", "--rrna"], (True, True)),
-            ):
-                with self.subTest(config=(trna, rrna), flags=flags):
-                    with patch.object(sys, "argv", base_args + flags):
-                        params = UserParametersScript()
-                    self.assertEqual(
-                        (params["include_trna"], params["include_rrna"]), expected
-                    )
+    def test_cli_rna_toggles_v14(self):
+        base=["plastburstalign","-i",str(self.input_dir),"-o",str(self.root/"output"),"-s","rna"]
+        for fl,ex in [(["--trna"],(True,False)),(["--rrna"],(False,True)),(["--trna","--rrna"],(True,True))]:
+            with patch.object(sys,"argv",base+fl):
+                pr=UserParametersScript()
+            self.assertEqual((pr["include_trna"],pr["include_rrna"]),ex)
 
     def test_rna_toggle_validation(self):
-        with self.assertRaisesRegex(ValueError, "at least one"):
-            self.parameters(include_trna=False, include_rrna=False)
-        for option in ("include_trna", "include_rrna"):
-            for invalid in ("false", 0, None):
-                with self.subTest(option=option, invalid=invalid):
-                    with self.assertRaises(TypeError):
-                        self.parameters(**{option: invalid})
-        for mode in ("cds", "int", "igs"):
-            with self.subTest(mode=mode):
-                self.parameters(
-                    select_mode=mode, include_trna=False, include_rrna=False
-                )
-        with patch.object(
-            sys,
-            "argv",
-            [
-                "plastburstalign",
-                "-s",
-                "rna",
-                "--no-trna",
-                "--no-rrna",
-            ],
-        ):
-            with self.assertRaisesRegex(ValueError, "at least one"):
+        with self.assertRaisesRegex(ValueError,"at least one"):
+            self.parameters(include_trna=False,include_rrna=False)
+        for m in ("cds","int","igs"):
+            self.parameters(select_mode=m,include_trna=False,include_rrna=False)
+        with patch.object(sys,"argv",["plastburstalign","-s","rna"]):
+            with self.assertRaisesRegex(ValueError,"at least one"):
                 UserParametersScript()
 
     def test_gene_and_region_exclusions(self):

@@ -95,7 +95,6 @@ pba = "plastburstalign.__main__:main"
 Homepage = "https://gruenstaeudl-lab.com/"
 Repository = "https://github.com/michaelgruenstaeudl/PlastBurstAlign"
 Issues = "https://github.com/michaelgruenstaeudl/PlastBurstAlign/issues"
-Changelog = "https://github.com/michaelgruenstaeudl/PlastBurstAlign/blob/main/CHANGELOG.md"
 
 [tool.mypy]
 python_version = "3.11"

@@ -36,7 +36,7 @@ class UserParameters(Dict[str, Any]):
         exclude_fullcds: Optional[List[str]] = None,
         exclude_region: Optional[List[str]] = None,
         min_seq_length: int = 3,
-        min_num_taxa: Union[int, float] = 1,
+        min_num_taxa: Union[int, float] = 0.01,
         num_threads: Union[str, int] = "auto",
         verbose: bool = False,
         order: str = "seq",
@@ -46,8 +46,8 @@ class UserParameters(Dict[str, Any]):
         alignment_tool_config: Optional[Dict[str, Any]] = None,
         alignment_command: Optional[str] = None,
         config_file: Optional[str] = None,
-        include_trna: bool = True,
-        include_rrna: bool = True,
+        include_trna: Optional[bool] = False,
+        include_rrna: Optional[bool] = False,
         adaptive_heuristics: bool = True,
         export_slurm: bool = False,
         slurm_partitions: int = 10,
@@ -97,8 +97,9 @@ class UserParameters(Dict[str, Any]):
             alignment_tool_path: Path to the alignment tool executable
             alignment_tool_config: Dictionary of tool-specific parameters
             config_file: Path to a YAML config file containing parameters
-            include_trna: Extract and align tRNAs in RNA mode (default True).
-            include_rrna: Extract and align rRNAs in RNA mode (default True).
+            include_trna: Extract and align tRNAs in RNA mode. If only one RNA option is provided, only that RNA type is included.
+            include_rrna: Extract and align rRNAs in RNA mode. If only one RNA option
+                is provided, only that RNA type is included.
         """
         super().__init__()
         # Cluster mode flags must be known before the input directory is validated:
@@ -173,9 +174,9 @@ class UserParameters(Dict[str, Any]):
             raise FileNotFoundError
         self["in_dir"] = in_dir
 
-    def _set_rna_options(self, include_trna: bool, include_rrna: bool):
-        self._test_type("include_trna", include_trna, bool)
-        self._test_type("include_rrna", include_rrna, bool)
+    def _set_rna_options(
+        self, include_trna: Optional[bool], include_rrna: Optional[bool]
+    ):
         if self["select_mode"] == "rna" and not (include_trna or include_rrna):
             message = "RNA mode requires at least one of include_trna or include_rrna to be enabled"
             log.critical(message)
@@ -483,14 +484,14 @@ class UserParametersScript(UserParameters):
         parser.add_argument(
             "--trna",
             dest="include_trna",
-            action=argparse.BooleanOptionalAction,
+            action="store_true",
             default=None,
             help="Enable or disable tRNA extraction and alignment in RNA mode (default: enabled)",
         )
         parser.add_argument(
             "--rrna",
             dest="include_rrna",
-            action=argparse.BooleanOptionalAction,
+            action="store_true",
             default=None,
             help="Enable or disable rRNA extraction and alignment in RNA mode (default: enabled)",
         )
