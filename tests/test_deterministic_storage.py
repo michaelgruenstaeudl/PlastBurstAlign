@@ -324,7 +324,9 @@ class ExtractionDeterminismTests(unittest.TestCase):
         params = UserParameters(
             in_dir=str(self.in_dir),
             out_dir=str(out_dir),
-            select_mode="rna", include_trna=True, include_rrna=True,
+            select_mode="rna",
+            include_trna=True,
+            include_rrna=True,
             num_threads=num_threads,
             min_seq_length=1,
             order=order,

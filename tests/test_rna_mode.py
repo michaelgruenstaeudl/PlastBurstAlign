@@ -52,7 +52,9 @@ class RNAModeTests(unittest.TestCase):
         values = {
             "in_dir": str(self.input_dir),
             "out_dir": str(self.root / "output"),
-            "select_mode": "rna", "include_trna": True, "include_rrna": True,
+            "select_mode": "rna",
+            "include_trna": True,
+            "include_rrna": True,
             "num_threads": 1,
             "min_seq_length": 1,
             "min_num_taxa": 1,
@@ -125,7 +127,10 @@ class RNAModeTests(unittest.TestCase):
         self.assertIs(params["select_mode"], SelectMode.RNA)
         self.assertFalse(params["select_mode"].collects_proteins())
         config = self.root / "config.yaml"
-        config.write_text('select_mode: "rna"\ninclude_trna: true\ninclude_rrna: true\n', encoding="ascii")
+        config.write_text(
+            'select_mode: "rna"\ninclude_trna: true\ninclude_rrna: true\n',
+            encoding="ascii",
+        )
         with patch.object(sys, "argv", base_args + ["--config", str(config)]):
             params = UserParametersScript()
         self.assertIs(params["select_mode"], SelectMode.RNA)
@@ -224,19 +229,31 @@ class RNAModeTests(unittest.TestCase):
                 self.assertEqual(list(data.nucleotides), expected)
 
     def test_cli_rna_toggles_v14(self):
-        base=["plastburstalign","-i",str(self.input_dir),"-o",str(self.root/"output"),"-s","rna"]
-        for fl,ex in [(["--trna"],(True,False)),(["--rrna"],(False,True)),(["--trna","--rrna"],(True,True))]:
-            with patch.object(sys,"argv",base+fl):
-                pr=UserParametersScript()
-            self.assertEqual((pr["include_trna"],pr["include_rrna"]),ex)
+        base = [
+            "plastburstalign",
+            "-i",
+            str(self.input_dir),
+            "-o",
+            str(self.root / "output"),
+            "-s",
+            "rna",
+        ]
+        for fl, ex in [
+            (["--trna"], (True, False)),
+            (["--rrna"], (False, True)),
+            (["--trna", "--rrna"], (True, True)),
+        ]:
+            with patch.object(sys, "argv", base + fl):
+                pr = UserParametersScript()
+            self.assertEqual((pr["include_trna"], pr["include_rrna"]), ex)
 
     def test_rna_toggle_validation(self):
-        with self.assertRaisesRegex(ValueError,"at least one"):
-            self.parameters(include_trna=False,include_rrna=False)
-        for m in ("cds","int","igs"):
-            self.parameters(select_mode=m,include_trna=False,include_rrna=False)
-        with patch.object(sys,"argv",["plastburstalign","-s","rna"]):
-            with self.assertRaisesRegex(ValueError,"at least one"):
+        with self.assertRaisesRegex(ValueError, "at least one"):
+            self.parameters(include_trna=False, include_rrna=False)
+        for m in ("cds", "int", "igs"):
+            self.parameters(select_mode=m, include_trna=False, include_rrna=False)
+        with patch.object(sys, "argv", ["plastburstalign", "-s", "rna"]):
+            with self.assertRaisesRegex(ValueError, "at least one"):
                 UserParametersScript()
 
     def test_gene_and_region_exclusions(self):

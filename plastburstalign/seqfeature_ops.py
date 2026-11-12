@@ -274,18 +274,12 @@ class GeneNameCleaner:
         # trnVUAC -> trnV_UAC
         # trnVTAC -> trnV_UAC
         attached_anticodon = match(
-            r"^(trn[A-Za-z])([ACGTUacgtu]{3})$",
-            gene,
-            flags=IGNORECASE
+            r"^(trn[A-Za-z])([ACGTUacgtu]{3})$", gene, flags=IGNORECASE
         )
 
         if attached_anticodon:
-            base_gene = (
-                "trn" + attached_anticodon.group(1)[3].upper()
-            )
-            anticodon = (
-                attached_anticodon.group(2).upper().replace("T", "U")
-            )
+            base_gene = "trn" + attached_anticodon.group(1)[3].upper()
+            anticodon = attached_anticodon.group(2).upper().replace("T", "U")
             return base_gene if cut_trna else f"{base_gene}_{anticodon}"
 
         # Look for standardized gene name
@@ -295,16 +289,13 @@ class GeneNameCleaner:
         if not gene_sub:
             return sub(r"\W+", "_", gene.replace("-", "_"))
 
-        cleaned_gene = (
-            gene_sub.group()[0:3].lower()
-            + gene_sub.group()[3:].upper()
-        )
+        cleaned_gene = gene_sub.group()[0:3].lower() + gene_sub.group()[3:].upper()
 
         if cut_trna:
             return cleaned_gene
 
         # Look for tRNA qualifiers
-        gene = gene[len(gene_sub.group()):]
+        gene = gene[len(gene_sub.group()) :]
         trna_pattern = r"([a-zA-Z]{3})"
         qual_subs = findall(trna_pattern, gene)
 
@@ -329,6 +320,7 @@ class GeneNameCleaner:
             cleaned_gene += "_" + anticodon
 
         return cleaned_gene
+
     def clean_rrna_gene(self, gene: Optional[str]) -> Optional[str]:
         """Standardizes recognized plastid rRNA names to their canonical gene names."""
         if not gene:

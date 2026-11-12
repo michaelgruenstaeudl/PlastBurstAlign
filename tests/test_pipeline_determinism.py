@@ -84,7 +84,9 @@ def _base_params(in_dir: Path, out_dir: Path, num_threads: int) -> UserParameter
     return UserParameters(
         in_dir=str(in_dir),
         out_dir=str(out_dir),
-        select_mode="rna", include_trna=True, include_rrna=True,
+        select_mode="rna",
+        include_trna=True,
+        include_rrna=True,
         alignment_tool="mafft",
         num_threads=num_threads,
         concat=True,
