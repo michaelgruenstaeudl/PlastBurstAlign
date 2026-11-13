@@ -48,13 +48,22 @@ Use a separate output directory for each run if you want to keep its results
 separate. For example, to align tRNAs and rRNAs:
 
 ```bash
-plastburstalign -i Input_dataset -o Output_RNA -s rna -a mafft
+plastburstalign -i Input_dataset -o Output_RNA -s rna --trna --rrna -a mafft
 ```
 
-RNA mode includes both types by default. Add `--no-rrna` for tRNAs only or
-`--no-trna` for rRNAs only. At least one type must remain enabled. RNA features
-are aligned directly as nucleotide sequences; joined feature parts are
-concatenated in strand-correct order, omitting intervening introns.
+RNA types are disabled by default in the command line. Pass `--trna` and
+`--rrna` to include both, or pass only one switch to extract only that type.
+At least one type must be enabled. For example:
+
+```bash
+# tRNAs only
+plastburstalign -i Input_dataset -o Output_tRNA -s rna --trna -a mafft
+# rRNAs only
+plastburstalign -i Input_dataset -o Output_rRNA -s rna --rrna -a mafft
+```
+
+RNA features are aligned directly as nucleotide sequences; joined feature parts
+are concatenated in strand-correct order, omitting intervening introns.
 
 Common options include:
 
@@ -71,12 +80,14 @@ Common options include:
 | `-n`, `--numthreads` | Number of CPUs to use, or `auto` | `-n 8` |
 | `-c`, `--concat` | Also write a concatenation of successful alignments | `-c` |
 | `--config` | Path to a YAML configuration file | `--config config.yaml` |
-| `--no-trna` | Exclude tRNAs in RNA mode | `--no-trna` |
-| `--no-rrna` | Exclude rRNAs in RNA mode | `--no-rrna` |
+| `--trna` | Include tRNAs in RNA mode (disabled unless specified) | `--trna` |
+| `--rrna` | Include rRNAs in RNA mode (disabled unless specified) | `--rrna` |
 
 Run `plastburstalign --help` for the full list of command-line options. YAML
 configuration keys use the parameter names shown in `config.yaml`, such as
-`in_dir`, `out_dir`, `select_mode`, and `alignment_tool`.
+`in_dir`, `out_dir`, `select_mode`, and `alignment_tool`. In CLI runs, pass
+`--trna` and/or `--rrna` explicitly for RNA mode; these switches default to
+disabled and override the corresponding YAML values.
 
 #### Output files
 

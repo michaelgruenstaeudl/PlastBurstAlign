@@ -6,16 +6,6 @@ A Python tool to extract and align genes, introns, and intergenic spacers across
 ### Purpose
 This software tool is designed for large-scale quality assessment of organellar genome annotations. It detects annotation discrepancies in large genome datasets by comparing sequence and annotation features through automated multiple sequence alignments across homologous regions.
 
-### Background
-The multiple sequence alignment (MSA) of a set of plastid genomes is challenging. At least five factors contribute to this challenge:
-- First, the plastid genome is a mosaic of individual genome regions. An MSA procedure must identify, extract, group, and align homologous regions across the input genomes.
-- Second, many plastid genomes contain annotation errors in gene positions and/or gene names. An MSA procedure must automatically exclude incorrectly annotated regions from the alignment procedure.
-- Third, plastid genomes comprise both coding and noncoding regions, which require different alignment strategies (e.g., amino acid-based for genes, nucleotide-based for introns and intergenic spacers). An MSA procedure must apply the appropriate strategy automatically.
-- Fourth, modern plastid genome studies often involve hundreds, if not thousands, of complete genomes. An MSA procedure must perform sequence alignment within practical time frames (e.g., hours rather than days).
-- Fifth, manually excluding user-specified genome regions after alignment is prohibitively complex. An MSA procedure must support the automatic exclusion of user-specified regions before the alignment starts.
-
-The software `plastburstalign` addresses these and other challenges: it provides an MSA procedure that extracts and aligns genes, introns, and intergenic spacers across hundreds or thousands of plastid genomes in an autonomous fashion.
-
 ### Overview of process
 ![Depiction of plastomes being split according to specified marker type; the extracted sequences are then aligned and concatenated](docs/PlastBurstAlign_ProcessOverview.png)
 
@@ -131,8 +121,8 @@ python benchmarking_IGS.py benchmark_YangEtAl2022_Asteraceae 5
 | `-l` | Minimum sequence length (bp); regions shorter than this are excluded| `-l 9` |
 | `-t` | Minimum number of taxa (int) or relative frequency (0<value<=1) in which a region must be present to be extracted | `-t 0.1` |
 | `-n` | Number of threads to use| `-n 8` |
-| `--trna` | Enable tRNAs in `rna` mode (default: disabled) | `--no-trna` |
-| `--rrna` | Enable rRNAs in `rna` mode (default: disabled) | `--no-rrna` |
+| `--trna` | Include tRNAs in `rna` mode (disabled unless specified) | `--trna` |
+| `--rrna` | Include rRNAs in `rna` mode (disabled unless specified) | `--rrna` |
 | `--config` | Path to YAML config file containing parameters | `--config config.yaml` |
 
 ---
@@ -146,7 +136,8 @@ Use `-s rna` (or `select_mode: "rna"` in a YAML configuration) to extract annota
 plastburstalign -i Input_dataset -o Output_RNA -s rna --trna --rrna -a mafft
 ```
 
-Both RNA types are disabled by default. Select only one type with:
+RNA types are disabled by default in the command line. Specify both switches
+to include both types, or just one switch to extract only that type:
 
 ```bash
 # tRNAs only
@@ -155,20 +146,9 @@ plastburstalign -i Input_dataset -o Output_tRNA -s rna --trna -a mafft
 plastburstalign -i Input_dataset -o Output_rRNA -s rna --rrna -a mafft
 ```
 
-The equivalent YAML and Python API parameters are `include_trna` and `include_rrna`
-(booleans, both defaulting to `true`). Explicit CLI switches override YAML values;
-omitted switches leave YAML values unchanged. Disabling both types in `rna` mode
-is an error. These switches do not affect `cds`, `int`, or `igs` mode.
+The corresponding Python API parameters are `include_trna` and `include_rrna` (both default to `false`). In CLI runs, the `--trna` and `--rrna` switches override YAML values for these parameters; because both switches default to disabled, pass the desired switch or switches when using RNA mode with a YAML configuration. If neither type is enabled, `rna` mode reports an error. These switches do not affect `cds`, `int`, or `igs` mode.
 
-RNA mode does not translate sequences, require start/stop codons, or trim sequences
-to a multiple of three. It extracts all annotated parts in strand-correct order;
-for joined features, the exons are concatenated and intervening introns are omitted.
-Features must have a `gene` qualifier, as in the other modes. Gene-name normalization
-(including tRNA names), removal of duplicate copies per genome, minimum sequence
-length and taxon thresholds, ordering, and optional concatenation all apply.
-Both `--exclcds` (gene exclusions) and `--exclreg` (region exclusions) can exclude RNA
-genes by their normalized names. Output uses the existing `nucl_` FASTA and NEXUS
-formats, with no protein files. The `cds`, `int`, and `igs` modes are unchanged.
+RNA mode does not translate sequences, require start/stop codons, or trim sequences to a multiple of three. It extracts all annotated parts in strand-correct order; for joined features, the exons are concatenated and intervening introns are omitted. Features must have a `gene` qualifier, as in the other modes. Gene-name  normalization (including tRNA names), removal of duplicate copies per genome, minimum sequence length and taxon thresholds, ordering, and optional concatenation all apply. Both `--exclcds` (gene exclusions) and `--exclreg` (region exclusions) can exclude RNA genes by their normalized names. Output uses the existing `nucl_` FASTA and NEXUS formats, with no protein files. The `cds`, `int`, and `igs` modes are unchanged.
 
 ### Source usage
 If you cloned the repository:
@@ -211,10 +191,8 @@ The plastid genome is a mosaic of individual genome regions, with many of its ge
 Due to the size and complexity of large DNA sequence alignments, individual genome regions can barely be removed from a concatenated sequence alignment; instead, any user-specified exclusion of a genome region must be performed before the actual sequence alignment. `plastburstalign` contains two functions for such an exclusion: commandline-parameter `exclude_region` excludes any user-specified region by exact name match from the dataset; commandline-parameter `exclude_fullcds` removes entire user-specified genes as well as any introns inside, and any intergenic spacers immediately adjacent to, the specified genes from the dataset.
 
 ### Details on automatic standardization of tRNA and rRNA gene names
-The names of all tRNAs are automatically standardized across the input genomes to counteract the accumulation of idiosyncratic gene names. tRNAs are often labeled differently by different researchers. For example, researcher A may label tRNAs with both amino acid abbreviations and anticodons (e.g., `trnA-Leu-UAA`), whereas researcher B may label them with the respective anticodons only (e.g., `trnA-UAA`). Similarly, researcher C may label tRNA genes with lower-case anticodons (e.g., `trnA-uaa`) but researcher D with upper-case anticodons (e.g., `trnA-UAA`). Differences in tRNA gene names may also originate from the idiosyncratic use of dashes versus underscores (e.g., `trnA-UAA` versus `trnA_UAA`). Leaving the names of tRNAs that code for the same gene unadjusted and, thus, incongruent across different input genomes risks the artificial increase in the number of unique genes, introns, and intergenic spacers in the dataset.
+tRNA gene annotations vary in format: they may include both an amino-acid abbreviation and an anticodon (e.g., `trnA-Leu-UAA`), only an anticodon (e.g., `trnA-UAA`), lowercase rather than uppercase anticodons (e.g., `trnA-uaa` versus `trnA-UAA`), or hyphens rather than underscores (e.g., `trnA-UAA` versus `trnA_UAA`).
 
 To ensure that only homologous genes are grouped together and aligned, `plastburstalign` automatically standardizes tRNA gene names across input genomes. Specifically, the software homogenizes incongruent tRNAs gene names to a single format: _tRNAabbreviation_anticodon_  (e.g., `trnA_UAA`). This format is (i) the most commonly used tRNA naming scheme among plastid genomes and (ii) the least problematic scheme for nucleotide sequence alignment operations, which typically interpret dashes as sequence characters. During the standardization operations, `plastburstalign` utilizes the [three-letter amino acid abbreviations](https://www.insdc.org/submitting-standards/feature-table/#7.4.3) and the [anticodon definitions](https://www.insdc.org/submitting-standards/genetic-code-tables/) of [translation table 11](https://www.insdc.org/submitting-standards/genetic-code-tables/) of the International Nucleotide Sequence Database Collaboration (INSDC). tRNAs with more than one possible codon but for which neither amino acid nor anticodon abbreviations are given in the gene name (e.g., `trnA` can be any of the following: `trnA_UAA`, `trnA_CAA`, `trnA_AAG`, `trnA_GAG`, `trnA_UAG`, and `trnA_CAG`), by contrast, are not changed by `plastburstalign` to avoid the incorrect designations.
 
 For rRNAs, recognized gene names and RNA-product labels are standardized to the canonical plastid gene names: 16S rRNA to `rrn16`, 23S rRNA to `rrn23`, 4.5S rRNA to `rrn4.5`, and 5S rRNA to `rrn5`.
-
-As a side effect, the automatic standardization of tRNA gene names also decreases the number of annotated genome regions that need to be removed from the dataset for not reaching the minimum number of taxa defined. Without the standardization, the intergenic spacer between the genes `trnA_CAA` and `ndhB`, for example, may be grouped under two different names (e.g., `trnA_CAA_ndhB` and `trnA_caa_ndhB`), with the latter group being less common and eventually removed from the dataset for not reaching the minimum number of taxa. By implementing a gene name standardization, the same intergenic spacer is grouped under only one name (i.e., `trnA_CAA_ndhB`) and not discarded. Preliminary tests indicated that the number of annotated genome regions that were removed due to not reaching the minimum number of taxa was decreased by approximately 25% through the tRNA gene name standardization.
