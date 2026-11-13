@@ -160,6 +160,39 @@ END;"""
         self.assertIn("geneB.outgroup", res.taxsets)
         self.assertEqual(res.charlabels[3], "lbl1")
 
+    def test_partition_files_format_and_coordinates(self):
+        import os
+        import tempfile
+
+        from plastburstalign.nexus_ops import (
+            fast_write_nexus_partitions,
+            fast_write_raxml_partitions,
+        )
+
+        charparts = {
+            "combined": {
+                "atpA": list(range(0, 500)),
+                "rbcL": list(range(500, 1928)),
+            }
+        }
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            raxml_path = os.path.join(tmp_dir, "parts.txt")
+            nex_path = os.path.join(tmp_dir, "parts.nex")
+
+            fast_write_raxml_partitions(raxml_path, charparts, datatype="dna")
+            fast_write_nexus_partitions(nex_path, charparts)
+
+            with open(raxml_path) as f:
+                raxml_content = f.read()
+            self.assertIn("DNA, atpA = 1-500", raxml_content)
+            self.assertIn("DNA, rbcL = 501-1928", raxml_content)
+
+            with open(nex_path) as f:
+                nex_content = f.read()
+            self.assertIn("CHARSET atpA = 1-500;", nex_content)
+            self.assertIn("CHARSET rbcL = 501-1928;", nex_content)
+            self.assertIn("CHARPARTITION combined = atpA:atpA, rbcL:rbcL;", nex_content)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -5,12 +5,12 @@
 import argparse
 import glob
 import os
-from pathlib import Path
 import subprocess
 import sys
 import tarfile
 import time
 import urllib.request
+from pathlib import Path
 
 
 def _resolve_dataset(dataset: str, script_dir: Path) -> Path:

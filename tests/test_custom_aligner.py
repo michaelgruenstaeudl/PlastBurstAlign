@@ -57,6 +57,7 @@ class CustomAlignerTests(unittest.TestCase):
     def test_cli_parsing_alignment_command(self):
         import sys
         from unittest.mock import patch
+
         from plastburstalign.user_parameters import UserParametersScript
 
         out_dir = os.path.join(self.temp_dir.name, "cli_out")

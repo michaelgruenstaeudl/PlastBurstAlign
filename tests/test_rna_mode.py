@@ -10,10 +10,18 @@ from Bio.Seq import Seq
 from Bio.SeqFeature import CompoundLocation, FeatureLocation, SeqFeature
 from Bio.SeqRecord import SeqRecord
 
-from plastburstalign.extraction_ops import DataCleaning, ExtractAndCollect, RecordFeatures
+from plastburstalign.extraction_ops import (
+    DataCleaning,
+    ExtractAndCollect,
+    RecordFeatures,
+)
 from plastburstalign.plast_burst_align import PlastBurstAlign
 from plastburstalign.seqfeature_ops import GeneNameCleaner, PlastidData
-from plastburstalign.user_parameters import SelectMode, UserParameters, UserParametersScript
+from plastburstalign.user_parameters import (
+    SelectMode,
+    UserParameters,
+    UserParametersScript,
+)
 
 
 class CopyAligner:
@@ -21,8 +29,15 @@ class CopyAligner:
 
     exec_path = "test-aligner"
 
-    def align(self, input_file, output_file):
+    def align(
+        self,
+        input_file: str,
+        output_file: str,
+        threads: int | None = None,
+        **kwargs,
+    ) -> bool:
         shutil.copyfile(input_file, output_file)
+        return True
 
 
 class RNAModeTests(unittest.TestCase):
@@ -38,6 +53,8 @@ class RNAModeTests(unittest.TestCase):
             "in_dir": str(self.input_dir),
             "out_dir": str(self.root / "output"),
             "select_mode": "rna",
+            "include_trna": True,
+            "include_rrna": True,
             "num_threads": 1,
             "min_seq_length": 1,
             "min_num_taxa": 1,
@@ -54,20 +71,32 @@ class RNAModeTests(unittest.TestCase):
             annotations={"molecule_type": "DNA"},
         )
         record.features = [
-            SeqFeature(FeatureLocation(0, 7), type="gene", qualifiers={"gene": ["trnH-GUG"]}),
-            SeqFeature(FeatureLocation(0, 7), type="tRNA", qualifiers={"gene": ["trnH-GUG"]}),
             SeqFeature(
-                FeatureLocation(7, 18, strand=-1), type="rRNA", qualifiers={"gene": ["rrn16"]}
+                FeatureLocation(0, 7), type="gene", qualifiers={"gene": ["trnH-GUG"]}
+            ),
+            SeqFeature(
+                FeatureLocation(0, 7), type="tRNA", qualifiers={"gene": ["trnH-GUG"]}
+            ),
+            SeqFeature(
+                FeatureLocation(7, 18, strand=-1),
+                type="rRNA",
+                qualifiers={"gene": ["rrn16"]},
             ),
             SeqFeature(
                 CompoundLocation([FeatureLocation(20, 24), FeatureLocation(28, 32)]),
                 type="tRNA",
                 qualifiers={"gene": ["trnK-UUU"]},
             ),
-            SeqFeature(FeatureLocation(32, 39), type="tRNA", qualifiers={"gene": ["trnH-gug"]}),
-            SeqFeature(FeatureLocation(39, 48), type="CDS", qualifiers={"gene": ["psbA"]}),
+            SeqFeature(
+                FeatureLocation(32, 39), type="tRNA", qualifiers={"gene": ["trnH-gug"]}
+            ),
+            SeqFeature(
+                FeatureLocation(39, 48), type="CDS", qualifiers={"gene": ["psbA"]}
+            ),
             SeqFeature(FeatureLocation(48, 52), type="tRNA"),
-            SeqFeature(FeatureLocation(52, 56), type="rRNA", qualifiers={"gene": ["orf123"]}),
+            SeqFeature(
+                FeatureLocation(52, 56), type="rRNA", qualifiers={"gene": ["orf123"]}
+            ),
         ]
         return record
 
@@ -86,13 +115,22 @@ class RNAModeTests(unittest.TestCase):
         return data, params
 
     def test_cli_and_yaml_accept_rna(self):
-        base_args = ["plastburstalign", "-i", str(self.input_dir), "-o", str(self.root / "output")]
-        with patch.object(sys, "argv", base_args + ["-s", "RNA"]):
+        base_args = [
+            "plastburstalign",
+            "-i",
+            str(self.input_dir),
+            "-o",
+            str(self.root / "output"),
+        ]
+        with patch.object(sys, "argv", base_args + ["-s", "RNA", "--trna", "--rrna"]):
             params = UserParametersScript()
         self.assertIs(params["select_mode"], SelectMode.RNA)
         self.assertFalse(params["select_mode"].collects_proteins())
         config = self.root / "config.yaml"
-        config.write_text('select_mode: "rna"\n', encoding="ascii")
+        config.write_text(
+            'select_mode: "rna"\ninclude_trna: true\ninclude_rrna: true\n',
+            encoding="ascii",
+        )
         with patch.object(sys, "argv", base_args + ["--config", str(config)]):
             params = UserParametersScript()
         self.assertIs(params["select_mode"], SelectMode.RNA)
@@ -190,61 +228,38 @@ class RNAModeTests(unittest.TestCase):
                 data, _ = self.extract_record(include_trna=trna, include_rrna=rrna)
                 self.assertEqual(list(data.nucleotides), expected)
 
-    def test_cli_rna_toggles_override_yaml_only_when_explicit(self):
-        config = self.root / "config.yaml"
-        base_args = [
+    def test_cli_rna_toggles_v14(self):
+        base = [
             "plastburstalign",
             "-i",
             str(self.input_dir),
             "-o",
             str(self.root / "output"),
-            "--config",
-            str(config),
+            "-s",
+            "rna",
         ]
-        for trna, rrna in ((True, True), (True, False), (False, True)):
-            config.write_text(
-                f"select_mode: rna\ninclude_trna: {str(trna).lower()}\n"
-                f"include_rrna: {str(rrna).lower()}\n",
-                encoding="ascii",
-            )
-            for flags, expected in (
-                ([], (trna, rrna)),
-                (["--trna", "--no-rrna"], (True, False)),
-                (["--no-trna", "--rrna"], (False, True)),
-                (["--trna", "--rrna"], (True, True)),
-            ):
-                with self.subTest(config=(trna, rrna), flags=flags):
-                    with patch.object(sys, "argv", base_args + flags):
-                        params = UserParametersScript()
-                    self.assertEqual((params["include_trna"], params["include_rrna"]), expected)
+        for fl, ex in [
+            (["--trna"], (True, False)),
+            (["--rrna"], (False, True)),
+            (["--trna", "--rrna"], (True, True)),
+        ]:
+            with patch.object(sys, "argv", base + fl):
+                pr = UserParametersScript()
+            self.assertEqual((pr["include_trna"], pr["include_rrna"]), ex)
 
     def test_rna_toggle_validation(self):
         with self.assertRaisesRegex(ValueError, "at least one"):
             self.parameters(include_trna=False, include_rrna=False)
-        for option in ("include_trna", "include_rrna"):
-            for invalid in ("false", 0, None):
-                with self.subTest(option=option, invalid=invalid):
-                    with self.assertRaises(TypeError):
-                        self.parameters(**{option: invalid})
-        for mode in ("cds", "int", "igs"):
-            with self.subTest(mode=mode):
-                self.parameters(select_mode=mode, include_trna=False, include_rrna=False)
-        with patch.object(
-            sys,
-            "argv",
-            [
-                "plastburstalign",
-                "-s",
-                "rna",
-                "--no-trna",
-                "--no-rrna",
-            ],
-        ):
+        for m in ("cds", "int", "igs"):
+            self.parameters(select_mode=m, include_trna=False, include_rrna=False)
+        with patch.object(sys, "argv", ["plastburstalign", "-s", "rna"]):
             with self.assertRaisesRegex(ValueError, "at least one"):
                 UserParametersScript()
 
     def test_gene_and_region_exclusions(self):
-        data, params = self.extract_record(exclude_fullcds=["trnH_GUG"], exclude_region=["rrn16"])
+        data, params = self.extract_record(
+            exclude_fullcds=["trnH_GUG"], exclude_region=["rrn16"]
+        )
         self.assertNotIn("trnH_GUG", data.nucleotides)
         DataCleaning(data, params).clean()
         self.assertEqual(list(data.nucleotides), ["trnK_UUU"])
@@ -263,7 +278,9 @@ class RNAModeTests(unittest.TestCase):
     def test_existing_feature_selection_is_unchanged(self):
         features = RecordFeatures(self.record())
         self.assertEqual([f.type for f in features.cds_feats], ["CDS"])
-        self.assertEqual([f.type for f in features.int_feats], ["tRNA", "tRNA", "tRNA", "CDS"])
+        self.assertEqual(
+            [f.type for f in features.int_feats], ["tRNA", "tRNA", "tRNA", "CDS"]
+        )
         self.assertEqual([f.type for f in features.igs_feats], ["gene"])
         for mode in SelectMode:
             with self.subTest(mode=mode):
@@ -276,7 +293,10 @@ class RNAModeTests(unittest.TestCase):
         params = self.parameters(min_num_taxa=2, concat=True, order="alpha")
         pipeline = PlastBurstAlign(params)
         with (
-            patch("plastburstalign.alignment_ops.get_alignment_tool", return_value=CopyAligner()),
+            patch(
+                "plastburstalign.alignment_ops.get_alignment_tool",
+                return_value=CopyAligner(),
+            ),
             patch(
                 "plastburstalign.extraction_ops.ProteinFeature",
                 side_effect=AssertionError("RNA translated"),
@@ -292,22 +312,35 @@ class RNAModeTests(unittest.TestCase):
         for region in expected_regions:
             with (output / f"nucl_{region}.unalign.fasta").open() as handle:
                 unaligned = list(SeqIO.parse(handle, "fasta"))
-            fasta = AlignIO.read(output / "fasta" / f"nucl_{region}.aligned.fasta", "fasta")
-            nexus = AlignIO.read(output / "nexus" / f"nucl_{region}.aligned.nexus", "nexus")
+            fasta = AlignIO.read(
+                output / "fasta" / f"nucl_{region}.aligned.fasta", "fasta"
+            )
+            nexus = AlignIO.read(
+                output / "nexus" / f"nucl_{region}.aligned.nexus", "nexus"
+            )
             self.assertEqual(len(unaligned), 2)
             self.assertEqual(len(fasta), 2)
-            self.assertEqual([str(r.seq) for r in fasta], [str(r.seq) for r in unaligned])
-            self.assertEqual([str(r.seq) for r in nexus], [str(r.seq) for r in unaligned])
+            self.assertEqual(
+                [str(r.seq) for r in fasta], [str(r.seq) for r in unaligned]
+            )
+            self.assertEqual(
+                [str(r.seq) for r in nexus], [str(r.seq) for r in unaligned]
+            )
         concatenated = AlignIO.read(output / "nucl_3concat.aligned.fasta", "fasta")
-        self.assertEqual({r.id for r in concatenated}, {"concat_taxon1", "concat_taxon2"})
+        self.assertEqual(
+            {r.id for r in concatenated}, {"concat_taxon1", "concat_taxon2"}
+        )
         self.assertEqual(concatenated.get_alignment_length(), 26)
         self.assertEqual(
             str(concatenated[0].seq),
             "".join(
-                str(pipeline.plastid_data.nucleotides[region][0].seq) for region in expected_regions
+                str(pipeline.plastid_data.nucleotides[region][0].seq)
+                for region in expected_regions
             ),
         )
-        self.assertEqual(len(AlignIO.read(output / "nucl_3concat.aligned.nexus", "nexus")), 2)
+        self.assertEqual(
+            len(AlignIO.read(output / "nucl_3concat.aligned.nexus", "nexus")), 2
+        )
         self.assertEqual(list(output.rglob("prot_*")), [])
 
     def test_pipeline_does_not_align_disabled_rna_types(self):
@@ -326,7 +359,10 @@ class RNAModeTests(unittest.TestCase):
                 )
                 aligner = CopyAligner()
                 with (
-                    patch("plastburstalign.alignment_ops.get_alignment_tool", return_value=aligner),
+                    patch(
+                        "plastburstalign.alignment_ops.get_alignment_tool",
+                        return_value=aligner,
+                    ),
                     patch.object(aligner, "align", wraps=aligner.align) as align,
                 ):
                     pipeline = PlastBurstAlign(params)

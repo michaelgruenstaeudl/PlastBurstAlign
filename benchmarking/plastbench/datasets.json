@@ -1,0 +1,118 @@
+{
+  "schema_version": 1,
+  "name": "PlastBench datasets",
+  "description": "Master datasets from which PlastBench tiers are drawn with the deterministic subsampler (`plastbench.py subsample`). Only the Asteraceae dataset is used by CI (smoke tier); larger tiers are meant for HPC runs.",
+  "seed": "plastbench-v1",
+  "datasets": [
+    {
+      "name": "benchmark_YangEtAl2022_Asteraceae",
+      "n_genomes": 155,
+      "source": "Asteraceae plastomes (GenBank flat files) from the accession list of Yang et al. 2022, doi:10.3389/fpls.2022.808156",
+      "zenodo_record": "17137737",
+      "url": "https://zenodo.org/records/17137737/files/benchmark_YangEtAl2022_Asteraceae.tar.gz?download=1",
+      "sha256": "0d58b67ff2bfcfa8299be2bf10eb820e832ddea0839725a80d652cc67aa2d2a0",
+      "md5": "ee2bdde3116fa8f69ff5a97d8592e324",
+      "size_bytes": 13851980,
+      "archive_root": "benchmark_YangEtAl2022_Asteraceae",
+      "status": "published",
+      "todo": null,
+      "notes": "155 .gb files; the accession list inside the archive has 156 lines (one record is not in the archive). The sha256 was computed by streaming the Zenodo archive and equals that of the copy downloaded by benchmarking/benchmarking_*.py; the md5 matches the Zenodo-reported md5."
+    },
+    {
+      "name": "benchmark_YangEtAl2022_monocots",
+      "n_genomes": 733,
+      "source": "monocot plastomes (GenBank flat files), Yang et al. 2022 accession list",
+      "zenodo_record": "17137737",
+      "url": "https://zenodo.org/records/17137737/files/benchmark_YangEtAl2022_monocots.tar.gz?download=1",
+      "sha256": "ec287ba3c2c08f29cfe3aed45d21736ebd9a9a561e5527d05772a72661f85b65",
+      "md5": "aef1b06d1c2857a480dce2c9349e1612",
+      "size_bytes": 61302495,
+      "archive_root": "benchmark_YangEtAl2022_monocots",
+      "status": "published",
+      "todo": null,
+      "notes": "n_genomes = number of .gb files, counted by streaming the archive; sha256/md5 computed by streaming it and the md5 equals the Zenodo-reported md5"
+    },
+    {
+      "name": "benchmark_YangEtAl2022_angiosperms",
+      "n_genomes": 2585,
+      "source": "angiosperm plastomes (GenBank flat files), Yang et al. 2022 accession list",
+      "zenodo_record": "17137737",
+      "url": "https://zenodo.org/records/17137737/files/benchmark_YangEtAl2022_angiosperms.tar.gz?download=1",
+      "sha256": "12e2f86a2da71b97279936969694eac8e0ae8210ee31fc8cc81e3b4fcfa4db9a",
+      "md5": "397dd6b92e6829623c56c88c4c310c1b",
+      "size_bytes": 229498805,
+      "archive_root": "benchmark_YangEtAl2022_angiosperms",
+      "status": "published",
+      "todo": null,
+      "notes": "n_genomes = number of .gb files, counted by streaming the archive; sha256/md5 computed by streaming it and the md5 equals the Zenodo-reported md5"
+    },
+    {
+      "name": "benchmark_ZhangNNEtAl2025_53angiosperms",
+      "n_genomes": 53,
+      "source": "53 angiosperm plastomes (GenBank flat files), Zhang et al. 2025 accession list",
+      "zenodo_record": "17137737",
+      "url": "https://zenodo.org/records/17137737/files/benchmark_ZhangNNEtAl2025_53angiosperms.tar.gz?download=1",
+      "sha256": "509e8daa2fbbabd3afbaf7ea4c1d47804d34c24f64d3d6345e52de338a2cd665",
+      "md5": "fdc35ca8cf60d839fcc71754198c7d84",
+      "size_bytes": 4846477,
+      "archive_root": "benchmark_ZhangNNEtAl2025_53angiosperms",
+      "status": "published",
+      "todo": null,
+      "notes": "n_genomes = number of .gb files, counted by streaming the archive; sha256/md5 computed by streaming it and the md5 equals the Zenodo-reported md5"
+    },
+    {
+      "name": "benchmark_ZhangNNEtAl2025_13724angiosperms",
+      "n_genomes": 13724,
+      "source": "13,724 angiosperm plastomes (GenBank flat files), Zhang et al. 2025 accession list",
+      "zenodo_record": "17137737",
+      "url": "https://zenodo.org/records/17137737/files/benchmark_ZhangNNEtAl2025_13724angiosperms.tar.gz?download=1",
+      "sha256": "8b03e33b30a77159ffb8ae33ffad857378e4992bcacef39b826f1175822b26ce",
+      "md5": "405b890ed01619f6b7e2e30b133363f4",
+      "size_bytes": 1232081534,
+      "archive_root": "benchmark_ZhangNNEtAl2025_13724angiosperms",
+      "status": "published",
+      "todo": null,
+      "notes": "1.2 GB archive; 13,724 .gb files counted by streaming the archive"
+    },
+    {
+      "name": "plastbench_15k_master",
+      "n_genomes": null,
+      "source": "TODO: a master directory of at least 15,000 GenBank plastomes (not assembled yet)",
+      "zenodo_record": null,
+      "url": null,
+      "sha256": null,
+      "md5": null,
+      "size_bytes": null,
+      "archive_root": "plastbench_15k_master",
+      "status": "unpublished",
+      "todo": "Maintainers: assemble >= 15,000 plastid genomes (the largest published master, benchmark_ZhangNNEtAl2025_13724angiosperms, has fewer), pack with `plastbench.py pack`, upload to Zenodo, then fill in zenodo_record, url, sha256, md5, size_bytes and n_genomes and set status to `published` (also in tiers.15k).",
+      "notes": null
+    }
+  ],
+  "tiers": {
+    "smoke": {
+      "n_genomes": 100,
+      "master": "benchmark_YangEtAl2022_Asteraceae",
+      "status": "published",
+      "todo": null
+    },
+    "1k": {
+      "n_genomes": 1000,
+      "master": "benchmark_YangEtAl2022_angiosperms",
+      "status": "published",
+      "todo": null
+    },
+    "5k": {
+      "n_genomes": 5000,
+      "master": "benchmark_ZhangNNEtAl2025_13724angiosperms",
+      "status": "published",
+      "todo": null
+    },
+    "15k": {
+      "n_genomes": 15000,
+      "master": "plastbench_15k_master",
+      "status": "unpublished",
+      "todo": "Needs a master with >= 15,000 genomes (see dataset plastbench_15k_master). Until then the largest runnable tier is 5k."
+    }
+  }
+}

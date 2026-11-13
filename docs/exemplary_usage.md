@@ -141,3 +141,25 @@ params = UserParameters(
 )
 PlastBurstAlign(params).execute()
 ```
+
+#### Additional CLI Flags & High-Level API
+
+| Option | Description | Example |
+| :--- | :--- | :--- |
+| `--trim` / `--min-occupancy` | In-flight site filtering (`occupancy=<f>`, `entropy`, `informative-only`, `gappyout`) | `--trim occupancy=0.5` |
+| `--partitions` / `--codon-partitions` | Emit `raxml`, `nexus`, `iqtree`, or `partitionfinder` files | `--partitions raxml,nexus` |
+| `--subdivide` | Sub-locus chunking (`auto`, `off`, or `force`) | `--subdivide off` |
+| `--seed` | Random seed for reproducible aligner runs | `--seed 1` |
+| `--memory-limit` / `--smt` / `--no-smt` | Memory admission cap and SMT core budget control | `--memory-limit 8G` |
+| `--doctor` / `--estimate` | Print host diagnostics or preflight cost estimate and exit | `plastburstalign --doctor` |
+| `--export-slurm` / `--align-partition` / `--finalize-slurm` | Distributed Slurm array workflow | `--export-slurm` |
+
+```python
+import plastburstalign as pba
+
+result = pba.align(
+    "Input_dataset", mode="cds", out_dir="Output_CDS", seed=1, trim="occupancy=0.5"
+)
+print(result.summary())
+```
+

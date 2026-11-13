@@ -2,6 +2,7 @@ import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+
 from plastburstalign.helpers import bounded_submit_iterator
 
 
@@ -40,7 +41,8 @@ class BoundedTaskQueueTests(unittest.TestCase):
             self.assertEqual(empty_results, [])
 
             single_results = [
-                fut.result() for _, fut in bounded_submit_iterator(executor, lambda x: x * 10, [42])
+                fut.result()
+                for _, fut in bounded_submit_iterator(executor, lambda x: x * 10, [42])
             ]
             self.assertEqual(single_results, [420])
 

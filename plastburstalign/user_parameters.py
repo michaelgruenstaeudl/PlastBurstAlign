@@ -1,13 +1,15 @@
 import argparse
+import math
 import multiprocessing
 import os
 from enum import Enum
-from typing import List, Union, Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Union
+
 import yaml
-import math
 
 # Package imports
-from .logging_ops import Logger, logger as log
+from .logging_ops import Logger
+from .logging_ops import logger as log
 
 
 class SelectMode(str, Enum):
@@ -46,6 +48,31 @@ class UserParameters(Dict[str, Any]):
         config_file: Optional[str] = None,
         include_trna: Optional[bool] = False,
         include_rrna: Optional[bool] = False,
+        adaptive_heuristics: bool = True,
+        export_slurm: bool = False,
+        slurm_partitions: int = 10,
+        slurm_cpus: int = 8,
+        slurm_mem: str = "16G",
+        slurm_time: str = "04:00:00",
+        slurm_partition: Optional[str] = None,
+        align_partition: Optional[int] = None,
+        finalize_slurm: bool = False,
+        manifest_path: Optional[str] = None,
+        individual_nexus: bool = True,
+        scratch_dir: Optional[str] = None,
+        keep_unaligned: bool = True,
+        subdivide: str = "auto",
+        trim: Optional[str] = None,
+        min_occupancy: Optional[float] = None,
+        partitions: str = "raxml,nexus",
+        codon_partitions: bool = False,
+        smt: Optional[bool] = None,
+        memory_limit: Optional[str] = None,
+        seed: Optional[int] = None,
+        phylip: bool = False,
+        time_budget: Optional[str] = None,
+        dashboard: Optional[bool] = None,
+        estimate: bool = False,
     ):
         """
         A dictionary that validates user parameters that are to be used within the package.
@@ -75,6 +102,13 @@ class UserParameters(Dict[str, Any]):
                 is provided, only that RNA type is included.
         """
         super().__init__()
+        # Cluster mode flags must be known before the input directory is validated:
+        # workers and the finalizer only use the existing feature store and are run
+        # from the output directory, where no `./input` exists.
+        self["align_partition"] = (
+            int(align_partition) if align_partition is not None else None
+        )
+        self["finalize_slurm"] = bool(finalize_slurm)
         self._set_select_mode(select_mode)
         self._set_rna_options(include_trna, include_rrna)
         self._set_in_dir(in_dir)
@@ -93,6 +127,31 @@ class UserParameters(Dict[str, Any]):
         self._set_alignment_tool_config(alignment_tool_config)
         self._set_alignment_command(alignment_command)
         self._set_config_file(config_file)
+        self._set_adaptive_heuristics(adaptive_heuristics)
+        self["export_slurm"] = bool(export_slurm)
+        self["slurm_partitions"] = int(slurm_partitions)
+        self["slurm_cpus"] = int(slurm_cpus)
+        self["slurm_mem"] = str(slurm_mem)
+        self["slurm_time"] = str(slurm_time)
+        self["slurm_partition"] = slurm_partition
+        self["manifest_path"] = manifest_path
+        self._set_individual_nexus(individual_nexus)
+        self._set_scratch_dir(scratch_dir)
+        self._set_keep_unaligned(keep_unaligned)
+        self._set_subdivide(subdivide)
+        self["trim"] = trim
+        self["min_occupancy"] = (
+            float(min_occupancy) if min_occupancy is not None else None
+        )
+        self["partitions"] = partitions
+        self["codon_partitions"] = bool(codon_partitions)
+        self["smt"] = smt
+        self["memory_limit"] = memory_limit
+        self["seed"] = int(seed) if seed is not None else None
+        self["phylip"] = bool(phylip)
+        self["time_budget"] = str(time_budget) if time_budget is not None else None
+        self["dashboard"] = dashboard
+        self["estimate"] = bool(estimate)
 
     def _set_select_mode(self, select_mode: str):
         try:
@@ -101,8 +160,16 @@ class UserParameters(Dict[str, Any]):
             log.critical(f"Invalid selection mode provided: `{select_mode}`")
             raise ValueError
 
-    def _set_in_dir(self, in_dir: str):
-        if not os.path.exists(in_dir) or not isinstance(in_dir, str):
+    def _set_in_dir(self, in_dir: Optional[str]):
+        is_cluster_worker_or_final = (
+            self.get("align_partition") is not None
+            or self.get("finalize_slurm") is True
+        )
+        if is_cluster_worker_or_final and (in_dir is None or in_dir == "./input"):
+            self["in_dir"] = in_dir or "./input"
+            return
+
+        if in_dir is None or not os.path.exists(in_dir) or not isinstance(in_dir, str):
             log.critical(f"Input directory `{in_dir}` does not exist.")
             raise FileNotFoundError
         self["in_dir"] = in_dir
@@ -173,27 +240,30 @@ class UserParameters(Dict[str, Any]):
         self["min_num_taxa"] = min_num_taxa
 
     def _set_num_threads(self, num_threads: Union[str, int]):
+        # Preserve the request for TuningPlan (``"auto"`` -> physical cpu_budget).
+        self["num_threads_requested"] = num_threads
+        resolved: Any = num_threads
         if isinstance(num_threads, str):
             num_threads_clean = num_threads.strip().lower()
             if num_threads_clean == "auto":
                 try:
-                    num_threads = os.cpu_count()
+                    resolved = os.cpu_count()
                 except NotImplementedError:
-                    num_threads = multiprocessing.cpu_count()
+                    resolved = multiprocessing.cpu_count()
             elif num_threads_clean.isnumeric():
-                num_threads = int(num_threads_clean)
+                resolved = int(num_threads_clean)
             else:
                 log.critical(f"Invalid `num_threads` value provided: {num_threads}")
                 raise ValueError
 
-        if num_threads is None:
-            num_threads = 1
+        if resolved is None:
+            resolved = 1
 
-        self._test_type("num_threads", num_threads, int)
-        if num_threads < 1:
-            log.critical(f"Invalid `num_threads` value provided: {num_threads}")
+        self._test_type("num_threads", resolved, int)
+        if resolved < 1:
+            log.critical(f"Invalid `num_threads` value provided: {resolved}")
             raise ValueError
-        self["num_threads"] = num_threads
+        self["num_threads"] = resolved
 
     def _set_verbose(self, verbose: bool):
         self._test_type("verbose", verbose, bool)
@@ -217,10 +287,14 @@ class UserParameters(Dict[str, Any]):
 
     def _set_alignment_tool_path(self, alignment_tool_path: Optional[str]):
         if alignment_tool_path and not os.path.exists(alignment_tool_path):
-            log.warning(f"Specified alignment tool path does not exist: {alignment_tool_path}")
+            log.warning(
+                f"Specified alignment tool path does not exist: {alignment_tool_path}"
+            )
         self["alignment_tool_path"] = alignment_tool_path
 
-    def _set_alignment_tool_config(self, alignment_tool_config: Optional[Dict[str, Any]]):
+    def _set_alignment_tool_config(
+        self, alignment_tool_config: Optional[Dict[str, Any]]
+    ):
         if alignment_tool_config is None:
             alignment_tool_config = {}
         self._test_type("alignment_tool_config", alignment_tool_config, dict)
@@ -238,11 +312,35 @@ class UserParameters(Dict[str, Any]):
             log.warning(f"Specified config file does not exist: {config_file}")
         self["config_file"] = config_file
 
+    def _set_adaptive_heuristics(self, adaptive_heuristics: bool):
+        self._test_type("adaptive_heuristics", adaptive_heuristics, bool)
+        self["adaptive_heuristics"] = adaptive_heuristics
+
     @staticmethod
     def _test_type(param_name: str, param_val: Any, expected_type: Any):
         if not isinstance(param_val, expected_type):
             log.critical(f"Invalid `{param_name}` type provided: {type(param_val)}")
             raise TypeError
+
+    def _set_individual_nexus(self, individual_nexus: bool):
+        self._test_type("individual_nexus", individual_nexus, bool)
+        self["individual_nexus"] = individual_nexus
+
+    def _set_scratch_dir(self, scratch_dir: Optional[str]):
+        if scratch_dir is not None:
+            self._test_type("scratch_dir", scratch_dir, str)
+        self["scratch_dir"] = scratch_dir
+
+    def _set_keep_unaligned(self, keep_unaligned: bool):
+        self._test_type("keep_unaligned", keep_unaligned, bool)
+        self["keep_unaligned"] = keep_unaligned
+
+    def _set_subdivide(self, subdivide: str):
+        token = str(subdivide or "auto").strip().lower()
+        if token not in {"auto", "off", "force"}:
+            log.critical(f"Invalid `subdivide` value provided: {subdivide}")
+            raise ValueError
+        self["subdivide"] = token
 
 
 class UserParametersScript(UserParameters):
@@ -266,6 +364,43 @@ class UserParametersScript(UserParameters):
         "alignmentcommand": "alignment_command",
         "alignmentcmd": "alignment_command",
         "config": "config_file",
+        "adaptive_heuristics": "adaptive_heuristics",
+        "adaptiveheuristics": "adaptive_heuristics",
+        "export_slurm": "export_slurm",
+        "exportslurm": "export_slurm",
+        "slurm_partitions": "slurm_partitions",
+        "slurmpartitions": "slurm_partitions",
+        "slurm_cpus": "slurm_cpus",
+        "slurmcpus": "slurm_cpus",
+        "slurm_mem": "slurm_mem",
+        "slurmmem": "slurm_mem",
+        "slurm_time": "slurm_time",
+        "slurmtime": "slurm_time",
+        "slurm_partition": "slurm_partition",
+        "slurmpartition": "slurm_partition",
+        "align_partition": "align_partition",
+        "alignpartition": "align_partition",
+        "finalize_slurm": "finalize_slurm",
+        "finalizeslurm": "finalize_slurm",
+        "manifest": "manifest_path",
+        "manifest_path": "manifest_path",
+        "individual_nexus": "individual_nexus",
+        "individualnexus": "individual_nexus",
+        "scratch_dir": "scratch_dir",
+        "scratchdir": "scratch_dir",
+        "keep_unaligned": "keep_unaligned",
+        "subdivide": "subdivide",
+        "trim": "trim",
+        "min_occupancy": "min_occupancy",
+        "partitions": "partitions",
+        "codon_partitions": "codon_partitions",
+        "smt": "smt",
+        "memory_limit": "memory_limit",
+        "seed": "seed",
+        "phylip": "phylip",
+        "time_budget": "time_budget",
+        "dashboard": "dashboard",
+        "estimate": "estimate",
     }
 
     def __init__(self):
@@ -280,7 +415,8 @@ class UserParametersScript(UserParameters):
         if hasattr(args, "config") and args.config:
             config_params = self._load_config_file(args.config)
 
-        # Merge command line args with config file, command line takes precedence
+        # Merge command line args with config file, command line takes precedence.
+        # ``--doctor`` / ``--version`` are handled in ``__main__`` before this runs.
         args_dict = self._get_construct_dict(args)
         merged_params = {**config_params, **args_dict}
 
@@ -349,14 +485,14 @@ class UserParametersScript(UserParameters):
             "--trna",
             dest="include_trna",
             action="store_true",
-            default=False,
+            default=None,
             help="Enable or disable tRNA extraction and alignment in RNA mode (default: enabled)",
         )
         parser.add_argument(
             "--rrna",
             dest="include_rrna",
             action="store_true",
-            default=False,
+            default=None,
             help="Enable or disable rRNA extraction and alignment in RNA mode (default: enabled)",
         )
         parser.add_argument(
@@ -464,12 +600,207 @@ class UserParametersScript(UserParameters):
             required=False,
             help="(Optional) Path to YAML config file containing parameters",
         )
+        parser.add_argument(
+            "--adaptiveheuristics",
+            dest="adaptive_heuristics",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help=(
+                "Enable adaptive PartTree heuristics for massive datasets (>1,000"
+                " sequences) (default: enabled)"
+            ),
+        )
+        parser.add_argument(
+            "--export-slurm",
+            dest="export_slurm",
+            action="store_true",
+            default=False,
+            help="Generate Slurm array job scripts and task manifest instead of local alignment",
+        )
+        parser.add_argument(
+            "--slurm-partitions",
+            dest="slurm_partitions",
+            type=int,
+            default=10,
+            help="Number of partitions to divide alignment tasks across (default: 10)",
+        )
+        parser.add_argument(
+            "--slurm-cpus",
+            dest="slurm_cpus",
+            type=int,
+            default=8,
+            help="CPUs per Slurm worker task (default: 8)",
+        )
+        parser.add_argument(
+            "--slurm-mem",
+            dest="slurm_mem",
+            type=str,
+            default="16G",
+            help="Memory allocated per Slurm worker task (default: 16G)",
+        )
+        parser.add_argument(
+            "--slurm-time",
+            dest="slurm_time",
+            type=str,
+            default="04:00:00",
+            help="Time limit for Slurm worker tasks (default: 04:00:00)",
+        )
+        parser.add_argument(
+            "--slurm-partition",
+            dest="slurm_partition",
+            type=str,
+            default=None,
+            help="Target Slurm queue/partition name",
+        )
+        parser.add_argument(
+            "--align-partition",
+            dest="align_partition",
+            type=int,
+            default=None,
+            help="Worker task: run alignment strictly for the assigned partition ID",
+        )
+        parser.add_argument(
+            "--finalize-slurm",
+            dest="finalize_slurm",
+            action="store_true",
+            default=False,
+            help="Finalizer task: verify all partition outputs and concatenate supermatrices",
+        )
+        parser.add_argument(
+            "--manifest",
+            dest="manifest_path",
+            type=str,
+            default=None,
+            help="Path to slurm_manifest.json (used by --align-partition and --finalize-slurm)",
+        )
+        parser.add_argument(
+            "--scratch-dir",
+            type=str,
+            default=None,
+            help="High-speed node-local scratch directory (defaults to $SLURM_TMPDIR or fast temp)",
+        )
+        parser.add_argument(
+            "--individual-nexus",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help="Write individual NEXUS alignment files for each region (default: true; disable to minimize I/O)",
+        )
+        parser.add_argument(
+            "--keep-unaligned",
+            dest="keep_unaligned",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help="Keep unaligned FASTA files in out_dir (default: true)",
+        )
+        parser.add_argument(
+            "--subdivide",
+            choices=("auto", "off", "force"),
+            default="auto",
+            help="Sub-locus chunking for long MAFFT loci (default: auto)",
+        )
+        parser.add_argument(
+            "--trim",
+            type=str,
+            default=None,
+            help="Site trim spec (none, occupancy=<f>, entropy, informative-only, gappyout)",
+        )
+        parser.add_argument(
+            "--min-occupancy",
+            dest="min_occupancy",
+            type=float,
+            default=None,
+            help="Minimum column occupancy when trimming (adds occupancy=<f>)",
+        )
+        parser.add_argument(
+            "--partitions",
+            type=str,
+            default="raxml,nexus",
+            help="Comma-separated partition formats: raxml,nexus,iqtree,partitionfinder,none",
+        )
+        parser.add_argument(
+            "--codon-partitions",
+            dest="codon_partitions",
+            action=argparse.BooleanOptionalAction,
+            default=False,
+            help="Emit codon-position partitions for CDS (default: false)",
+        )
+        parser.add_argument(
+            "--smt",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help="Include SMT siblings in the CPU budget (default: host-tuned)",
+        )
+        parser.add_argument(
+            "--memory-limit",
+            dest="memory_limit",
+            type=str,
+            default=None,
+            help="Memory admission cap (e.g. 8G)",
+        )
+        parser.add_argument(
+            "--seed",
+            type=int,
+            default=None,
+            help="MAFFT --randomseed value for deterministic runs",
+        )
+        parser.add_argument(
+            "--phylip",
+            action=argparse.BooleanOptionalAction,
+            default=False,
+            help="Also write a relaxed PHYLIP concatenated alignment (default: false)",
+        )
+        parser.add_argument(
+            "--doctor",
+            action="store_true",
+            default=False,
+            help="Diagnose host, aligners and scratch; exit without aligning",
+        )
+        parser.add_argument(
+            "--version",
+            action="store_true",
+            default=False,
+            help="Print version and exit",
+        )
+        parser.add_argument(
+            "--estimate",
+            action="store_true",
+            default=False,
+            help="Print a pre-flight cost estimate after extract/clean and exit",
+        )
+        parser.add_argument(
+            "--dashboard",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help="Enable or disable the rich live dashboard (default: auto)",
+        )
+        parser.add_argument(
+            "--time-budget",
+            dest="time_budget",
+            type=str,
+            default=None,
+            help=(
+                "Opt-in non-reproducible host-adaptive time budget "
+                "(e.g. 2h); currently recorded with a warning only"
+            ),
+        )
         return parser
 
     @classmethod
     def _get_construct_dict(cls, args: argparse.Namespace) -> Dict[str, Any]:
         # map the cmd argument names to class constructor parameters,
         # and remove empty argument values (`None`)
+        skip = {"doctor", "version"}
         args_dict = vars(args)
-        args_dict = {cls._construct_name_map[k]: v for k, v in args_dict.items() if v is not None}
+        args_dict = {
+            cls._construct_name_map[k]: v
+            for k, v in args_dict.items()
+            if v is not None and k not in skip and k in cls._construct_name_map
+        }
+        # BooleanOptionalAction leaves False intact; keep estimate/dashboard
+        # when explicitly False so --no-dashboard is honoured.
+        raw = vars(args)
+        if "estimate" in raw and raw["estimate"]:
+            args_dict["estimate"] = True
+        if "dashboard" in raw and raw["dashboard"] is not None:
+            args_dict["dashboard"] = bool(raw["dashboard"])
         return args_dict
