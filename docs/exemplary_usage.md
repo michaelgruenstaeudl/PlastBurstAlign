@@ -161,6 +161,5 @@ result = pba.align(
     "Input_dataset", mode="cds", out_dir="Output_CDS", seed=1, trim="occupancy=0.5"
 )
 print(result.summary())
-
 ```
 
