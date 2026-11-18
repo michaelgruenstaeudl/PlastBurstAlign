@@ -372,6 +372,15 @@ def determine_alignment_strategy(
             f"{terms.primary:.3e} + pairwise {terms.pairwise:.3e})"
         )
 
+        # Global Scale Guard: For N >= 10,000 taxa, force EXTREME_SCALE (--retree 1) unless overridden
+        if (
+            n_seq >= 10000
+            and tier < AlignmentTier.EXTREME_SCALE
+            and "n_force_parttree" not in ov
+        ):
+            tier = AlignmentTier.EXTREME_SCALE
+            reason = f"N={n_seq} >= 10000 (forced EXTREME_SCALE); " + reason
+
         # Legacy explicit N-count gates (deprecated, honoured only when given).
         legacy_pt = ov.get("parttree_threshold")
         legacy_r1 = ov.get("retree1_threshold")

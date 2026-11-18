@@ -241,6 +241,61 @@ class FeatureIsolationTests(unittest.TestCase):
         self.assertTrue(set(patched) < set(baseline))
         self.assertTrue(any(f.stage == "feature:igs" for f in report.feature_failures))
 
+    def test_negative_strand_and_origin_wrap_intron_slicing(self) -> None:
+        """Negative-strand introns exclude exons; 0-bp circular origin wraps are ignored."""
+        from Bio.Seq import Seq
+        from Bio.SeqFeature import CompoundLocation, FeatureLocation, SeqFeature
+        from Bio.SeqRecord import SeqRecord
+
+        from plastburstalign.seqfeature_ops import PlastidDict
+
+        # 1000 bp circular genome:
+        # 1) Negative-strand CDS with exon1=[300:360](-), intron=[200:300](-), exon2=[100:200](-)
+        #    True intron on (+) strand isA*100 -> reverse-complement on (-) is T*100 (length 100, not 260)
+        # 2) Origin-wrapping tRNA with part1=[950:1000](+), part2=[0:30](+) -> 0 bp wrap across origin
+        seq_str = ("G" * 200) + ("A" * 100) + ("C" * 700)
+        rec = SeqRecord(
+            Seq(seq_str),
+            id="TEST01",
+            name="TEST01",
+            annotations={"topology": "circular"},
+        )
+        neg_cds = SeqFeature(
+            CompoundLocation(
+                [
+                    FeatureLocation(300, 360, strand=-1),
+                    FeatureLocation(100, 200, strand=-1),
+                ]
+            ),
+            type="CDS",
+            qualifiers={"gene": ["ndhB"]},
+        )
+        wrap_trna = SeqFeature(
+            CompoundLocation(
+                [
+                    FeatureLocation(950, 1000, strand=1),
+                    FeatureLocation(0, 30, strand=1),
+                ]
+            ),
+            type="tRNA",
+            qualifiers={"gene": ["trnH-GUG"]},
+        )
+        rec.features = [neg_cds, wrap_trna]
+
+        from plastburstalign.extraction_ops import ExtractAndCollect
+
+        ext = ExtractAndCollect.__new__(ExtractAndCollect)
+        ext.exclude_cds = []
+        ext.exclude_region = []
+        ext.min_seq_length = 3
+        out = PlastidDict()
+        ext._extract_int(rec, out)
+
+        self.assertIn("ndhB_intron1", out)
+        self.assertEqual(len(out["ndhB_intron1"][0].seq), 100)
+        self.assertEqual(str(out["ndhB_intron1"][0].seq), "T" * 100)
+        self.assertNotIn("trnH_GUG_intron1", out)
+
     def test_bad_intron_does_not_drop_the_genome(self) -> None:
         record = self._record()
         cleaner = GeneNameCleaner()

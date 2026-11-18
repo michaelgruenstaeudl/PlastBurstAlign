@@ -270,6 +270,7 @@ def _scan_genbank_block(
     rec_name = ""
     rec_id = ""
     description = ""
+    topology: str | None = None
     def_parts: list[str] = []
     in_def = False
 
@@ -280,6 +281,12 @@ def _scan_genbank_block(
             if len(parts) >= 2:
                 rec_name = parts[1]
                 rec_id = rec_name
+            # GenBank LOCUS: ... bp  mol_type  topology  division  date
+            lowered = {p.lower() for p in parts}
+            if "circular" in lowered:
+                topology = "circular"
+            elif "linear" in lowered:
+                topology = "linear"
             in_def = False
         elif line.startswith("DEFINITION"):
             def_parts.append(line[10:].strip())
@@ -450,6 +457,8 @@ def _scan_genbank_block(
     flush_feat()
 
     annotations: dict[str, str | int] = {}
+    if topology is not None:
+        annotations["topology"] = topology
     if n_skipped:
         annotations["pba_skipped_features"] = n_skipped
         annotations["pba_skipped_feature_details"] = "\n".join(skipped)

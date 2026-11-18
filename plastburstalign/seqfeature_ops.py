@@ -7,7 +7,7 @@ from typing import Any, ClassVar, Optional
 from Bio import SeqUtils
 from Bio.Data import CodonTable
 from Bio.Seq import Seq
-from Bio.SeqFeature import ExactPosition, FeatureLocation, SeqFeature
+from Bio.SeqFeature import CompoundLocation, ExactPosition, FeatureLocation, SeqFeature
 from Bio.SeqRecord import SeqRecord
 
 from .extraction_report import ExtractionReport
@@ -20,6 +20,68 @@ from .user_parameters import SelectMode
 _INVALID_RESIDUES = re_compile(r"[^ACGTURYSWKMBDHVNacgturyswkmbdhvn]")
 # Region names become file names; real gene names are far shorter.
 MAX_REGION_NAME_CHARS = 100
+
+
+def record_topology(record: Any) -> str | None:
+    """Read ``circular`` / ``linear`` from record annotations if present."""
+    ann = getattr(record, "annotations", None) or {}
+    topo = ann.get("topology")
+    if topo is None:
+        return None
+    text = str(topo).strip().lower()
+    if text in {"circular", "linear"}:
+        return text
+    return None
+
+
+def circular_intron_bounds(
+    exon1: Any,
+    exon2: Any,
+    parent_len: int,
+    topology: str | None = None,
+) -> FeatureLocation | CompoundLocation | None:
+    """Build the minimal-arc intron location between two exon parts.
+
+    Enforces the shortest-arc topological invariant on circular plastomes,
+    preserving transcript strand polarity and avoiding whole-genome (~150 kb)
+    slices across origin-wrapping exons.
+    """
+    try:
+        s1, e1 = int(exon1.start), int(exon1.end)
+        s2, e2 = int(exon2.start), int(exon2.end)
+        strand = getattr(exon1, "strand", None)
+        if strand is None:
+            strand = getattr(exon2, "strand", None)
+    except Exception:
+        return None
+
+    parent = int(parent_len)
+
+    if s2 >= e1:
+        linear_len = s2 - e1
+        linear_coords = (e1, s2)
+        wrap_len = ((parent - e2) + s1) if parent > 0 else linear_len + 1
+        wrap_coords = ((e2, parent), (0, s1))
+    elif s1 >= e2:
+        linear_len = s1 - e2
+        linear_coords = (e2, s1)
+        wrap_len = ((parent - e1) + s2) if parent > 0 else linear_len + 1
+        wrap_coords = ((e1, parent), (0, s2))
+    else:
+        return None
+
+    if linear_len <= wrap_len:
+        if linear_len <= 0:
+            return None
+        return FeatureLocation(linear_coords[0], linear_coords[1], strand=strand)
+
+    topo = (topology or "").strip().lower()
+    if topo == "linear" or parent <= 0 or wrap_len <= 0:
+        return None
+
+    part_a = FeatureLocation(wrap_coords[0][0], wrap_coords[0][1], strand=strand)
+    part_b = FeatureLocation(wrap_coords[1][0], wrap_coords[1][1], strand=strand)
+    return CompoundLocation([part_a, part_b])
 
 
 class PlastidData:
@@ -379,6 +441,12 @@ class PlastidFeature:
         """
         self._exception = None
         self.seq_obj = None
+        self._parent_len = (
+            len(record.seq)
+            if record is not None and getattr(record, "seq", None) is not None
+            else 0
+        )
+        self._topology = record_topology(record)
 
         self._set_feat_name(feature)
         self._set_rec_name(record)
@@ -396,6 +464,9 @@ class PlastidFeature:
         self.feature = feature
 
     def _set_seq_obj(self, record: SeqRecord):
+        if self.feature is None:
+            self._set_exception(ValueError("invalid or inverted feature coordinates"))
+            return
         try:
             seq = self.feature.extract(record).seq
             bad = _INVALID_RESIDUES.search(str(seq))
@@ -403,6 +474,10 @@ class PlastidFeature:
                 raise ValueError(
                     f"invalid nucleotide character {bad.group()!r} at position"
                     f" {bad.start() + 1} of the feature"
+                )
+            if self._parent_len > 0 and len(seq) > self._parent_len:
+                raise ValueError(
+                    f"extracted feature length ({len(seq)} bp) exceeds parent genome ({self._parent_len} bp)"
                 )
             self.seq_obj = seq
         except Exception as e:
@@ -570,12 +645,11 @@ class IntronFeature(PlastidFeature):
         super()._set_feature(feature)
         exon_1 = self.feature.location.parts[self.offset]
         exon_2 = self.feature.location.parts[self.offset + 1]
-        in_order = exon_2.start >= exon_1.end
-
-        if in_order:
-            self.feature.location = FeatureLocation(exon_1.end, exon_2.start)
-        else:
-            self.feature.location = FeatureLocation(exon_2.start, exon_1.end)
+        loc = circular_intron_bounds(exon_1, exon_2, self._parent_len, self._topology)
+        if loc is None:
+            self.feature = None
+            return
+        self.feature.location = loc
 
 
 class IntergenicFeature(PlastidFeature):

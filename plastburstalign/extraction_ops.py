@@ -25,6 +25,8 @@ from .seqfeature_ops import (
     PlastidDict,
     PlastidFeature,
     ProteinFeature,
+    circular_intron_bounds,
+    record_topology,
 )
 from .task_queue import get_mp_context
 
@@ -877,15 +879,18 @@ class ExtractAndCollect:
         Extracts all INT (introns) from a given sequence record
         """
 
+        parent_len = (
+            len(rec.seq)
+            if rec is not None and getattr(rec, "seq", None) is not None
+            else 0
+        )
+        topology = record_topology(rec)
+
         def _add_intron(feature_obj: SeqFeature, offset: int):
             exon_1 = feature_obj.location.parts[offset]
             exon_2 = feature_obj.location.parts[offset + 1]
-            intron_len = (
-                abs(int(exon_2.start) - int(exon_1.end))
-                if exon_2.start >= exon_1.end
-                else abs(int(exon_1.start) - int(exon_2.end))
-            )
-            if intron_len < self.min_seq_length:
+            loc = circular_intron_bounds(exon_1, exon_2, parent_len, topology)
+            if loc is None or len(loc) < self.min_seq_length:
                 return
 
             gene_name = PlastidFeature.name_cleaner.get_safe_gene(feature_obj)

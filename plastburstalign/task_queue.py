@@ -401,15 +401,15 @@ class CoreBudgetPool:
     ) -> dict[str, int]:
         """Calculates optimal core allocation per locus via mathematical makespan balancing.
 
-        Accounts for super-quadratic complexity and cache-miss overhead in ultra-long,
-        divergent sequences (L >= 1800 aa), allocating cores to true critical stragglers
-        while preserving single-core efficiency for standard loci.
+        Allocates cores to heavy and critical straggler loci based on computational volume
+        (N x L), sequence length, and taxon scale, while preserving single-core throughput
+        for lightweight loci in asynchronous queues.
         """
         if not tasks_meta or total_cores <= 1:
             return {k: 1 for k in tasks_meta}
 
         K = len(tasks_meta)
-        C = total_cores
+        C = max(1, int(total_cores))
 
         work: dict[str, float] = {}
         p_max: dict[str, int] = {}
@@ -417,20 +417,24 @@ class CoreBudgetPool:
         for k, (n, length) in tasks_meta.items():
             n_eff = max(1, n)
             l_eff = max(1, length)
+            cells = n_eff * l_eff
 
-            # Super-quadratic complexity scaling for ultra-long unanchored loci
-            if l_eff >= 1800:
+            # Workload and core ceiling scaling:
+            # Massive loci (long sequences, high taxon count, or high cell volume)
+            # must receive multi-core allocations to prevent straggler timeouts.
+            if l_eff >= 1800 or cells >= 3.5e7 or n_eff >= 50000:
                 w = float(n_eff * (l_eff**2.4))
                 ceiling = min(8, C)
-            elif l_eff >= 1200:
+            elif l_eff >= 1200 or cells >= 1.8e7 or n_eff >= 30000:
                 w = float(n_eff * (l_eff**2.1))
                 ceiling = min(4, C)
-            elif l_eff >= 600:
+            elif l_eff >= 600 or cells >= 5.0e6 or n_eff >= 10000:
                 w = float(n_eff * (l_eff**2.0))
                 ceiling = min(2, C)
             else:
                 w = float(n_eff * (l_eff**2.0))
                 ceiling = 1
+
             work[k] = w
             p_max[k] = max(1, ceiling)
 
@@ -438,7 +442,7 @@ class CoreBudgetPool:
         if total_work <= 0:
             return {k: 1 for k in tasks_meta}
 
-        # Sparse Workload Regime (K < C)
+        # Sparse Workload Regime (K < C): spread idle cores across all tasks
         if K < C:
             work_scaled = {k: work[k] ** (1.0 / alpha) for k in work}
             sum_scaled = sum(work_scaled.values())
@@ -466,38 +470,16 @@ class CoreBudgetPool:
                             break
             return allocations
 
-        # Dense Workload Regime (K >= C)
+        # Dense Workload Regime (K >= C):
         ideal_makespan = total_work / C
-        sorted_keys = sorted(work.keys(), key=lambda x: work[x], reverse=True)
-
-        # True critical stragglers must significantly exceed ideal makespan
-        outliers = [
-            k for k in sorted_keys if work[k] > (1.2 * ideal_makespan) and p_max[k] > 1
-        ]
-
         allocations = {k: 1 for k in work}
-        if not outliers:
-            return allocations
-
-        # Allow critical stragglers to access full node capacity
-        cores_remaining = C
-        for k in outliers:
-            wanted = p_max[k]
-            grant = min(wanted, cores_remaining)
-            if grant >= 8:
-                p = 8
-            elif grant >= 4:
-                p = 4
-            elif grant >= 2:
-                p = 2
-            else:
-                p = 1
-
-            allocations[k] = p
-            cores_remaining = max(0, cores_remaining - p)
-            if cores_remaining < 2:
-                break
-
+        for k in work:
+            if p_max[k] > 1 and (
+                work[k] > (1.2 * ideal_makespan)
+                or tasks_meta[k][0] >= 30000
+                or (tasks_meta[k][0] * tasks_meta[k][1]) >= 2.0e7
+            ):
+                allocations[k] = p_max[k]
         return allocations
 
     @staticmethod

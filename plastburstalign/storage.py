@@ -25,16 +25,24 @@ class DiskBackedFeatureStore:
 
     def __init__(self, db_path: str | Path | None = None) -> None:
         self.db_path = str(db_path) if db_path is not None else ":memory:"
-        self._conn = sqlite3.connect(self.db_path, timeout=30.0)
+        self._conn = sqlite3.connect(self.db_path, timeout=60.0)
         self._conn.row_factory = sqlite3.Row
         self._in_transaction = False
         self._registered_regions: set[str] = set()
         self._init_db()
         self._local = threading.local()
 
-    def _init_db(self) -> None:
-        cursor = self._conn.cursor()
-        cursor.execute("PRAGMA journal_mode = WAL;")
+    @staticmethod
+    def _apply_connection_pragmas(
+        conn: sqlite3.Connection, *, configure_journal: bool = False
+    ) -> None:
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA busy_timeout = 60000;")
+        if configure_journal:
+            try:
+                cursor.execute("PRAGMA journal_mode = WAL;")
+            except sqlite3.OperationalError:
+                cursor.execute("PRAGMA journal_mode = TRUNCATE;")
         cursor.execute("PRAGMA synchronous = NORMAL;")
         cursor.execute("PRAGMA cache_size = -131072;")  # 128 MB RAM page cache
         cursor.execute(
@@ -43,6 +51,10 @@ class DiskBackedFeatureStore:
         cursor.execute(
             "PRAGMA mmap_size = 3221225472;"
         )  # 3 GB memory-mapped I/O direct access
+
+    def _init_db(self) -> None:
+        self._apply_connection_pragmas(self._conn, configure_journal=True)
+        cursor = self._conn.cursor()
 
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS regions (
@@ -398,8 +410,9 @@ class DiskBackedFeatureStore:
         if self.db_path == ":memory:":
             return self._conn
         if not hasattr(self._local, "conn"):
-            conn = sqlite3.connect(self.db_path, timeout=30.0)
+            conn = sqlite3.connect(self.db_path, timeout=60.0)
             conn.row_factory = sqlite3.Row
+            self._apply_connection_pragmas(conn, configure_journal=False)
             self._local.conn = conn
         return self._local.conn
 

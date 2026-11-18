@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import signal
 import subprocess
 import tempfile
 from abc import ABC, abstractmethod
@@ -24,6 +25,96 @@ from .strategy import (
 )
 from .strategy_constants import DEFAULT_CONSTANTS
 from .task_queue import pin_command
+
+
+class AlignmentTimeout(TimeoutError):
+    """Raised when an aligner subprocess exceeds its deadline."""
+
+    def __init__(self, timeout: float, cmd: Sequence[str] | str) -> None:
+        self.timeout = float(timeout)
+        if isinstance(cmd, str):
+            cmd_str = cmd
+        else:
+            cmd_str = " ".join(str(part) for part in cmd)
+        self.cmd = cmd_str
+        super().__init__(f"alignment timed out after {self.timeout:.1f}s: {cmd_str}")
+
+
+def _kill_process_tree(proc: subprocess.Popen[Any]) -> None:
+    """SIGTERM then SIGKILL the process group / tree (plastbench-style)."""
+    if proc.pid is None:
+        return
+    try:
+        import psutil
+
+        try:
+            parent = psutil.Process(proc.pid)
+            victims = [*parent.children(recursive=True), parent]
+        except psutil.Error:
+            victims = []
+        for victim in victims:
+            try:
+                victim.terminate()
+            except psutil.Error:
+                pass
+        _, alive = psutil.wait_procs(victims, timeout=5) if victims else ([], [])
+        for victim in alive:
+            try:
+                victim.kill()
+            except psutil.Error:
+                pass
+    except Exception:
+        pass
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.kill()
+        except OSError:
+            pass
+    try:
+        proc.wait(timeout=5)
+    except Exception:
+        pass
+
+
+def run_aligner_subprocess(
+    cmd: Sequence[str] | str,
+    *,
+    stdout: Any = subprocess.DEVNULL,
+    stderr: Any = subprocess.PIPE,
+    text: bool = True,
+    env: Mapping[str, str] | None = None,
+    timeout: float | None = None,
+    shell: bool = False,
+) -> subprocess.CompletedProcess[Any]:
+    """Run an aligner command; on timeout kill the tree and raise AlignmentTimeout."""
+    popen_cmd: Any = cmd if shell or isinstance(cmd, str) else list(cmd)
+    proc = subprocess.Popen(
+        popen_cmd,
+        stdout=stdout,
+        stderr=stderr,
+        text=text,
+        env=dict(env) if env is not None else None,
+        shell=shell,
+        start_new_session=True,
+    )
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        _kill_process_tree(proc)
+        try:
+            out, err = proc.communicate(timeout=5)
+        except Exception:
+            out, err = getattr(exc, "stdout", None), getattr(exc, "stderr", None)
+        raise AlignmentTimeout(float(timeout or 0.0), cmd) from exc
+    return subprocess.CompletedProcess(
+        args=cmd if not isinstance(cmd, list) else list(cmd),
+        returncode=proc.returncode,
+        stdout=out,
+        stderr=err,
+    )
+
 
 #: Translation table dropping everything that is not a residue (stop, gaps, space).
 _NON_RESIDUES = str.maketrans("", "", "*-. \t\r\n")
@@ -508,16 +599,20 @@ class MAFFT(AlignmentTool):
         cmd: list[str],
         output_file: str,
         env: Mapping[str, str] | None = None,
+        timeout: float | None = None,
     ) -> bool:
-        """Run ``cmd`` with stdout redirected to ``output_file``."""
+        """Run ``cmd`` with stdout redirected to ``output_file``.
+
+        Raises :class:`AlignmentTimeout` when ``timeout`` is exceeded.
+        """
         with open(output_file, "w") as out_handle:
-            process = subprocess.run(
+            process = run_aligner_subprocess(
                 cmd,
                 stdout=out_handle,
                 stderr=subprocess.PIPE,
                 text=True,
-                check=False,
                 env=dict(env) if env is not None else self._get_subprocess_env(),
+                timeout=timeout,
             )
         if process.returncode == 0:
             return True
@@ -560,6 +655,7 @@ class MAFFT(AlignmentTool):
         cpu_ids: Sequence[int] | None = None,
         env: Mapping[str, str] | None = None,
         pin: bool = False,
+        timeout: float | None = None,
     ) -> bool:
         """Align a locus that has sequences too short for PartTree.
 
@@ -613,7 +709,7 @@ class MAFFT(AlignmentTool):
                 cpu_ids=cpu_ids,
                 pin=pin,
             )
-            return self._run_to_file(cmd, output_file, env=env)
+            return self._run_to_file(cmd, output_file, env=env, timeout=timeout)
 
         scratch = self._fragment_scratch(env)
         try:
@@ -633,7 +729,7 @@ class MAFFT(AlignmentTool):
                 f"      short-sequence path: aligning {len(main)} sequences with "
                 f"{strategy.tier.name}, then adding {len(short)} short sequence(s)"
             )
-            if not self._run_to_file(cmd, main_aln, env=env):
+            if not self._run_to_file(cmd, main_aln, env=env, timeout=timeout):
                 return False
             aligned_path = main_aln
             if short:
@@ -654,7 +750,9 @@ class MAFFT(AlignmentTool):
                     add_cmd.append("--quiet")
                 add_cmd.append(main_aln)
                 add_cmd = self._prepare_cmd(add_cmd, cpu_ids=cpu_ids, pin=pin)
-                if not self._run_to_file(add_cmd, combined_aln, env=env):
+                if not self._run_to_file(
+                    add_cmd, combined_aln, env=env, timeout=timeout
+                ):
                     if add_flag == "--addfragments":
                         log.warning(
                             "    --addfragments failed/segfaulted on short fragments; falling back to --add"
@@ -667,7 +765,9 @@ class MAFFT(AlignmentTool):
                         fallback_cmd = self._prepare_cmd(
                             fallback_cmd, cpu_ids=cpu_ids, pin=pin
                         )
-                        if not self._run_to_file(fallback_cmd, combined_aln, env=env):
+                        if not self._run_to_file(
+                            fallback_cmd, combined_aln, env=env, timeout=timeout
+                        ):
                             return False
                     else:
                         return False
@@ -724,6 +824,7 @@ class MAFFT(AlignmentTool):
         cpu_ids: Sequence[int] | None = None,
         env: Mapping[str, str] | None = None,
         pin: bool = False,
+        timeout: float | None = None,
         **kwargs: Any,
     ) -> bool:
         """Perform alignment using MAFFT with dynamic threads and adaptive heuristics.
@@ -734,9 +835,13 @@ class MAFFT(AlignmentTool):
         detection. `algorithm_args` pins the algorithm (used for sub-locus chunks);
         it must not contain ``--auto``. `cpu_ids` / `pin` prefix ``taskset`` when
         the scheduler is pinning, and `env` is the child environment (``TMPDIR``).
+        ``timeout`` is a subprocess wall-clock deadline in seconds.
         """
         if not self._validate_input(input_file, output_file):
             return False
+        # kwargs may carry timeout from generic plumbing
+        if timeout is None and kwargs.get("timeout") is not None:
+            timeout = float(kwargs["timeout"])
 
         try:
             alpha = self._detect_alphabet(input_file, alphabet)
@@ -752,7 +857,7 @@ class MAFFT(AlignmentTool):
                     cpu_ids=cpu_ids,
                     pin=pin,
                 )
-                if self._run_to_file(cmd, output_file, env=env):
+                if self._run_to_file(cmd, output_file, env=env, timeout=timeout):
                     log.info(
                         f"      successfully aligned {os.path.basename(input_file)} "
                         f"using MAFFT ({' '.join(cmd[1:])})"
@@ -778,6 +883,7 @@ class MAFFT(AlignmentTool):
                         cpu_ids=cpu_ids,
                         env=env,
                         pin=pin,
+                        timeout=timeout,
                     )
                 # forward the resolved statistics so the command build never rescans
                 sequence_count, max_len, min_len = (
@@ -797,13 +903,15 @@ class MAFFT(AlignmentTool):
                 cpu_ids=cpu_ids,
                 pin=pin,
             )
-            if self._run_to_file(cmd, output_file, env=env):
+            if self._run_to_file(cmd, output_file, env=env, timeout=timeout):
                 log.info(
                     f"      successfully aligned {os.path.basename(input_file)} using"
                     f" MAFFT ({' '.join(cmd[1:])})"
                 )
                 return True
             return False
+        except AlignmentTimeout:
+            raise
         except Exception as e:
             log.error(f"   error during MAFFT alignment: {e}")
             return False
@@ -857,14 +965,15 @@ class ClustalOmega(AlignmentTool):
             if kwargs.get("pin"):
                 cmd = pin_command(cmd, kwargs.get("cpu_ids"))
             child_env = kwargs.get("env")
+            timeout = kwargs.get("timeout")
             log.debug(f"   running Clustal Omega with command: {' '.join(cmd)}")
-            process = subprocess.run(
+            process = run_aligner_subprocess(
                 cmd,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
                 text=True,
-                check=False,
                 env=dict(child_env) if child_env else self._get_subprocess_env(),
+                timeout=float(timeout) if timeout is not None else None,
             )
             if process.returncode == 0:
                 log.info(
@@ -877,6 +986,8 @@ class ClustalOmega(AlignmentTool):
                     f"   Clustal Omega failed with return code {process.returncode}"
                 )
                 return False
+        except AlignmentTimeout:
+            raise
         except Exception as e:
             log.error(f"   error during Clustal Omega alignment: {e}")
             return False
@@ -930,14 +1041,15 @@ class MUSCLE(AlignmentTool):
             if kwargs.get("pin"):
                 cmd = pin_command(cmd, kwargs.get("cpu_ids"))
             child_env = kwargs.get("env")
+            timeout = kwargs.get("timeout")
             log.debug(f"   running MUSCLE with command: {' '.join(cmd)}")
-            process = subprocess.run(
+            process = run_aligner_subprocess(
                 cmd,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
                 text=True,
-                check=False,
                 env=dict(child_env) if child_env else self._get_subprocess_env(),
+                timeout=float(timeout) if timeout is not None else None,
             )
             if process.returncode == 0:
                 log.info(
@@ -948,6 +1060,8 @@ class MUSCLE(AlignmentTool):
             else:
                 log.error(f"   MUSCLE failed with return code {process.returncode}")
                 return False
+        except AlignmentTimeout:
+            raise
         except Exception as e:
             log.error(f"   error during MUSCLE alignment: {e}")
             return False
@@ -1044,14 +1158,15 @@ class GenericAlignmentTool(AlignmentTool):
             if kwargs.get("pin"):
                 cmd = pin_command(cmd, kwargs.get("cpu_ids"))
             child_env = kwargs.get("env")
+            timeout = kwargs.get("timeout")
             log.debug(f"   running generic aligner with command: {' '.join(cmd)}")
-            process = subprocess.run(
+            process = run_aligner_subprocess(
                 cmd,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
                 text=True,
-                check=False,
                 env=dict(child_env) if child_env else self._get_subprocess_env(),
+                timeout=float(timeout) if timeout is not None else None,
             )
             if process.returncode == 0:
                 log.info(
@@ -1064,6 +1179,8 @@ class GenericAlignmentTool(AlignmentTool):
                     f"   generic aligner failed with return code {process.returncode}"
                 )
                 return False
+        except AlignmentTimeout:
+            raise
         except Exception as e:
             log.error(f"   error during generic alignment: {e}")
             return False
@@ -1216,20 +1333,21 @@ class CustomAligner(AlignmentTool):
 
         try:
             child_env = kwargs.get("env")
-            process = subprocess.run(
+            timeout = kwargs.get("timeout")
+            process = run_aligner_subprocess(
                 cmd_str,
                 shell=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                check=False,
                 env=dict(child_env) if child_env else self._get_subprocess_env(),
+                timeout=float(timeout) if timeout is not None else None,
             )
 
             if process.returncode != 0:
                 log.error(
                     "Custom alignment failed with returncode"
-                    f" {process.returncode}: {process.stderr.strip()}"
+                    f" {process.returncode}: {(process.stderr or '').strip()}"
                 )
                 return False
 
@@ -1246,6 +1364,8 @@ class CustomAligner(AlignmentTool):
             )
             return True
 
+        except AlignmentTimeout:
+            raise
         except Exception as e:
             log.error(f"Exception encountered during custom alignment execution: {e}")
             return False
