@@ -794,7 +794,8 @@ class MAFFT(AlignmentTool):
                         raise ValueError(f"MAFFT output lacks the record {header!r}")
                     if (
                         not reverse_complemented
-                        and row.replace("-", "").upper() != "".join(seq.split()).upper()
+                        and row.translate(_NON_RESIDUES).upper()
+                        != seq.translate(_NON_RESIDUES).upper()
                     ):
                         mismatched += 1
                     _write_wrapped(

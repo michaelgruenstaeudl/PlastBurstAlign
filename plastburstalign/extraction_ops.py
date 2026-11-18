@@ -1014,6 +1014,8 @@ class RecordFeatures:
         A generator of intron-bearing CDS and tRNA features in the record.
         """
         for f in self._features:
+            if f.qualifiers.get("trans_splicing"):
+                continue
             if self._keep(f, ("CDS", "tRNA")):
                 yield f
 
@@ -1115,7 +1117,17 @@ class FeatureRearranger:
     @staticmethod
     def _get_is_trans(feature: SeqFeature, gene: str) -> bool:
         trans_genes = ["rps12"]
-        return bool(feature.qualifiers.get("trans_splicing")) or gene in trans_genes
+        if bool(feature.qualifiers.get("trans_splicing")) or gene in trans_genes:
+            return True
+        if isinstance(feature.location, CompoundLocation):
+            parts = feature.location.parts
+            strands = {p.strand for p in parts if p.strand is not None}
+            if len(strands) > 1:
+                return True
+            span = max(int(p.end) for p in parts) - min(int(p.start) for p in parts)
+            if span > 15_000:
+                return True
+        return False
 
     def _tuple_from_feature(
         self, feature: SeqFeature, index: int | None = None

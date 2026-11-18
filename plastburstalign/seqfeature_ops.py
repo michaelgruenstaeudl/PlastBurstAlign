@@ -49,13 +49,16 @@ def circular_intron_bounds(
     try:
         s1, e1 = int(exon1.start), int(exon1.end)
         s2, e2 = int(exon2.start), int(exon2.end)
-        strand = getattr(exon1, "strand", None)
-        if strand is None:
-            strand = getattr(exon2, "strand", None)
+        st1 = getattr(exon1, "strand", None)
+        st2 = getattr(exon2, "strand", None)
+        if st1 is not None and st2 is not None and st1 != st2:
+            return None
+        strand = st1 if st1 is not None else st2
     except Exception:
         return None
 
     parent = int(parent_len)
+    max_intron = 10_000 if parent > 20_000 else max(parent, 10_000)
 
     if s2 >= e1:
         linear_len = s2 - e1
@@ -71,12 +74,12 @@ def circular_intron_bounds(
         return None
 
     if linear_len <= wrap_len:
-        if linear_len <= 0:
+        if linear_len <= 0 or (parent > 0 and linear_len > max_intron):
             return None
         return FeatureLocation(linear_coords[0], linear_coords[1], strand=strand)
 
     topo = (topology or "").strip().lower()
-    if topo == "linear" or parent <= 0 or wrap_len <= 0:
+    if topo == "linear" or parent <= 0 or wrap_len <= 0 or wrap_len > max_intron:
         return None
 
     part_a = FeatureLocation(wrap_coords[0][0], wrap_coords[0][1], strand=strand)

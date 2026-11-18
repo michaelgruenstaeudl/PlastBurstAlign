@@ -76,6 +76,7 @@ def resolve_tuning_plan(
         smt=user_params.get("smt"),
         memory_limit=user_params.get("memory_limit"),
         workload=workload or None,
+        supermatrix_shape=(0, 0),
     )
     return plan
 

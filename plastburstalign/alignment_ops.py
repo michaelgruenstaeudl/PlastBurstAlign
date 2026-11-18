@@ -381,7 +381,7 @@ class AlignmentCoordination:
         """
         shared = os.path.join(self._out_dir, f"{seq_type}_{region}.unalign.fasta")
         if os.path.exists(shared) and os.path.getsize(shared) > 0:
-            return shared, False
+            return shared, not self.keep_unaligned
         # Durable copies are created by ``save_unaligned`` (monolithic keep path).
         # Workers and ``keep_unaligned=False`` always export into scratch.
         if self.keep_unaligned and self._unaligned_saved:
@@ -588,6 +588,7 @@ class AlignmentCoordination:
                             task_id=f"c{idx:02d}",
                             fn=chunk_fn,
                             work=max(1.0, work / max(1, plan_chunks.n_chunks)),
+                            priority=max(1.0, work),
                             preferred_threads=1,
                             max_threads=max_threads,
                             n_seq=spec.n_seq,
@@ -871,6 +872,7 @@ class AlignmentCoordination:
                             task_id=f"c{idx:02d}",
                             fn=chunk_fn,
                             work=max(1.0, work / max(1, plan_chunks.n_chunks)),
+                            priority=max(1.0, work),
                             preferred_threads=1,
                             max_threads=max_threads,
                             n_seq=spec.n_seq,
