@@ -518,6 +518,8 @@ def _read_aligned(path: str | os.PathLike[str]) -> dict[str, str]:
 
 def _conform_row(aligned: str, original: str, label: str) -> str:
     """Return ``aligned`` with the residues (and case) of ``original``."""
+    if "*" in original and "*" not in aligned:
+        original = original.replace("*", "")
     stripped = aligned.replace(GAP, "")
     if stripped == original:
         return aligned
@@ -566,7 +568,10 @@ def splice_alignments(
     for c, spec in enumerate(plan.chunks):
         members = plan.chunk_sequences(c)
         if not spec.needs_alignment:
-            rows = {row: piece for row, piece in members}
+            rows = {
+                row: (piece.replace("*", "") if plan.alphabet == "prot" else piece)
+                for row, piece in members
+            }
             width = max((len(p) for p in rows.values()), default=0)
         else:
             path = aligned_chunk_paths[c]

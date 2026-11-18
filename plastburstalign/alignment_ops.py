@@ -29,7 +29,12 @@ from .align_runtime import (
 )
 from .alignment_tools import MAFFT, AlignmentTool, get_alignment_tool
 from .autotune import TuningPlan
-from .chunking import ChunkConfig, plan_chunks_with_reason, splice_alignments
+from .chunking import (
+    ChunkConfig,
+    ChunkSpliceError,
+    plan_chunks_with_reason,
+    splice_alignments,
+)
 from .ephemeral_engine import ScratchEngine
 from .events import ProgressSink
 from .helpers import bounded_submit_iterator, resolve_scratch_dir, split_list
@@ -613,6 +618,15 @@ class AlignmentCoordination:
                                     and status != "ok"
                                 ):
                                     failed = True
+                            if not failed:
+                                try:
+                                    splice_alignments(plan_chunks, paths, out_aligned)
+                                except ChunkSpliceError as exc:
+                                    log.warning(
+                                        f"chunk splice of `{region}` failed ({exc}); "
+                                        "falling back to unchunked"
+                                    )
+                                    failed = True
                             if failed:
                                 log.warning(
                                     f"chunked alignment of `{region}` failed; "
@@ -637,7 +651,6 @@ class AlignmentCoordination:
                                 if ok:
                                     self._record_success(region, out_aligned)
                                 return ok
-                            splice_alignments(plan_chunks, paths, out_aligned)
                             self._record_locus(
                                 region,
                                 alphabet="nucl",
@@ -897,6 +910,18 @@ class AlignmentCoordination:
                                     and status != "ok"
                                 ):
                                     failed = True
+                            if not failed:
+                                try:
+                                    splice_alignments(
+                                        plan_chunks, paths, out_aligned_prot
+                                    )
+                                    ok = True
+                                except ChunkSpliceError as exc:
+                                    log.warning(
+                                        f"chunked protein splice of `{region}` failed ({exc}); "
+                                        "falling back to unchunked"
+                                    )
+                                    failed = True
                             if failed:
                                 log.warning(
                                     f"chunked protein alignment of `{region}` failed; "
@@ -910,9 +935,6 @@ class AlignmentCoordination:
                                     ctx=fctx,
                                     alphabet="prot",
                                 )
-                            else:
-                                splice_alignments(plan_chunks, paths, out_aligned_prot)
-                                ok = True
                             return self._finish_protein_locus(
                                 region,
                                 out_aligned_prot,
