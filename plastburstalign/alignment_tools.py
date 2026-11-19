@@ -718,7 +718,22 @@ class MAFFT(AlignmentTool):
             main_aln = os.path.join(scratch, "main.aln")
             combined_aln = os.path.join(scratch, "combined.aln")
             _write_fasta_records(main_fa, ((f"m{i}", records[i][1]) for i in main))
-            _write_fasta_records(short_fa, ((f"m{i}", records[i][1]) for i in short))
+
+            # Deduplicate identical short sequences so large loci with thousands
+            # of repeated 1-5 bp strings only align each unique short string once.
+            uniq_short: dict[str, int] = {}
+            short_rep_idx: dict[int, int] = {}
+            for i in short:
+                key = records[i][1].translate(_NON_RESIDUES).upper()
+                rep_i = uniq_short.get(key)
+                if rep_i is None:
+                    uniq_short[key] = i
+                    short_rep_idx[i] = i
+                else:
+                    short_rep_idx[i] = rep_i
+            _write_fasta_records(
+                short_fa, ((f"m{i}", records[i][1]) for i in uniq_short.values())
+            )
 
             cmd = self._prepare_cmd(
                 self._assemble_command(strategy.mafft_args, main_fa, threads, alphabet),
@@ -727,11 +742,13 @@ class MAFFT(AlignmentTool):
             )
             log.info(
                 f"      short-sequence path: aligning {len(main)} sequences with "
-                f"{strategy.tier.name}, then adding {len(short)} short sequence(s)"
+                f"{strategy.tier.name}, then adding {len(short)} short sequence(s) "
+                f"({len(uniq_short)} unique)"
             )
             if not self._run_to_file(cmd, main_aln, env=env, timeout=timeout):
                 return False
             aligned_path = main_aln
+            subsampled_main_rows: dict[str, str] | None = None
             if short:
                 cap_add = int(
                     self.tool_params.get(
@@ -739,6 +756,34 @@ class MAFFT(AlignmentTool):
                     )
                 )
                 add_flag = "--addfragments" if len(main) <= cap_add else "--add"
+                target_main_aln = main_aln
+                max_rep_n = 256
+                if add_flag == "--add" and len(main) > max_rep_n:
+                    subsampled_main_rows = _read_aligned_fasta(main_aln)
+                    w_main = len(next(iter(subsampled_main_rows.values()), ""))
+                    step = max(1, len(main) // max_rep_n)
+                    rep_ids = [f"m{i}" for i in main[::step][:max_rep_n]]
+                    rep_rows = [subsampled_main_rows[rid] for rid in rep_ids]
+                    guard_chars: list[str] = []
+                    default_char = "A"
+                    for col_idx in range(w_main):
+                        ch = "-"
+                        for r_str in rep_rows:
+                            c = r_str[col_idx]
+                            if c != "-":
+                                ch = c
+                                break
+                        if ch == "-":
+                            ch = default_char
+                        guard_chars.append(ch)
+                    rep_aln_path = os.path.join(scratch, "rep_main.aln")
+                    _write_fasta_records(
+                        rep_aln_path,
+                        [("pba_col_guard", "".join(guard_chars))]
+                        + [(rid, subsampled_main_rows[rid]) for rid in rep_ids],
+                    )
+                    target_main_aln = rep_aln_path
+
                 mafft_threads = (
                     threads
                     if threads is not None
@@ -748,7 +793,7 @@ class MAFFT(AlignmentTool):
                 add_cmd.extend(["--thread", str(mafft_threads)])
                 if self.tool_params.get("quiet"):
                     add_cmd.append("--quiet")
-                add_cmd.append(main_aln)
+                add_cmd.append(target_main_aln)
                 add_cmd = self._prepare_cmd(add_cmd, cpu_ids=cpu_ids, pin=pin)
                 if not self._run_to_file(
                     add_cmd, combined_aln, env=env, timeout=timeout
@@ -761,7 +806,7 @@ class MAFFT(AlignmentTool):
                         fallback_cmd.extend(["--thread", str(mafft_threads)])
                         if self.tool_params.get("quiet"):
                             fallback_cmd.append("--quiet")
-                        fallback_cmd.append(main_aln)
+                        fallback_cmd.append(target_main_aln)
                         fallback_cmd = self._prepare_cmd(
                             fallback_cmd, cpu_ids=cpu_ids, pin=pin
                         )
@@ -774,6 +819,21 @@ class MAFFT(AlignmentTool):
                 aligned_path = combined_aln
 
             combined = _read_aligned_fasta(aligned_path)
+            if subsampled_main_rows is not None:
+                guard_after = combined.pop("pba_col_guard", None)
+                if guard_after is None:
+                    guard_after = combined.pop("_R_pba_col_guard", None)
+                w_main = len(next(iter(subsampled_main_rows.values()), ""))
+                if guard_after is not None and len(guard_after) > w_main:
+                    insert_mask = [c == "-" for c in guard_after]
+                    for k_id, orig_row in subsampled_main_rows.items():
+                        it = iter(orig_row)
+                        combined[k_id] = "".join(
+                            "-" if is_ins else next(it, "-") for is_ins in insert_mask
+                        )
+                else:
+                    combined.update(subsampled_main_rows)
+
             widths = {len(row) for row in combined.values()}
             if len(widths) > 1:
                 raise ValueError("MAFFT returned rows of unequal length")
@@ -783,15 +843,21 @@ class MAFFT(AlignmentTool):
             with open(output_file, "w") as out_handle:
                 for i, (header, seq) in enumerate(records):
                     reverse_complemented = False
+                    lookup_i = short_rep_idx.get(i, i)
                     if i in empty_set:
                         row = "-" * width
-                    elif f"m{i}" in combined:
-                        row = combined[f"m{i}"]
-                    elif f"_R_m{i}" in combined:  # reverse-complemented by MAFFT
-                        row = combined[f"_R_m{i}"]
+                    elif f"m{lookup_i}" in combined:
+                        row = combined[f"m{lookup_i}"]
+                    elif f"_R_m{lookup_i}" in combined:  # reverse-complemented by MAFFT
+                        row = combined[f"_R_m{lookup_i}"]
                         reverse_complemented = True
                     else:
                         raise ValueError(f"MAFFT output lacks the record {header!r}")
+                    if lookup_i != i and not reverse_complemented:
+                        orig_chars = iter(seq.translate(_NON_RESIDUES))
+                        row = "".join(
+                            "-" if c == "-" else next(orig_chars, c) for c in row
+                        )
                     if (
                         not reverse_complemented
                         and row.translate(_NON_RESIDUES).upper()
@@ -853,6 +919,35 @@ class MAFFT(AlignmentTool):
                         "chunk alignments must not pass --auto; pin the full-locus "
                         "algorithm instead"
                     )
+                uses_parttree = any(
+                    arg in ("--parttree", "--fastaparttree", "--dpparttree")
+                    for arg in pinned
+                )
+                if uses_parttree:
+                    eff_min = (
+                        min_len
+                        if min_len is not None
+                        else self._scan_fasta_meta(input_file)[1]
+                    )
+                    if eff_min < DEFAULT_CONSTANTS.min_parttree_seq_len:
+                        pinned_strategy = AlignmentStrategy(
+                            tier=AlignmentTier.HIGH_SCALE,
+                            mafft_args=pinned,
+                            work=0.0,
+                            needs_fragment_split=True,
+                            reason="pinned PartTree chunk with short (<6) sequences",
+                        )
+                        return self._align_with_fragments(
+                            input_file,
+                            output_file,
+                            threads,
+                            pinned_strategy,
+                            alpha,
+                            cpu_ids=cpu_ids,
+                            env=env,
+                            pin=pin,
+                            timeout=timeout,
+                        )
                 cmd = self._prepare_cmd(
                     self._assemble_command(pinned, input_file, threads, alpha),
                     cpu_ids=cpu_ids,

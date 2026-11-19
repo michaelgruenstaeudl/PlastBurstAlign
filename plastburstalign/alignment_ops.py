@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import os
+import re
 import shutil
 import tempfile
 import threading
@@ -505,8 +506,13 @@ class AlignmentCoordination:
         work = work_for_locus(summary_entry, alphabet="nucl")
         bytes_est = unaligned_bytes_estimate(summary_entry)
         cap = max(1, int(plan.threads_per_task_cap))
-        pref = max(1, min(int(preferred), cap))
-        max_threads = cap if support.get("threads") else 1
+        can_thread = bool(support.get("threads")) and not (
+            self._is_mafft()
+            and strategy.uses_parttree
+            and not strategy.needs_fragment_split
+        )
+        pref = max(1, min(int(preferred), cap)) if can_thread else 1
+        max_threads = cap if can_thread else 1
         est_mem = plan.est_mem_bytes(
             max(1, n_seq),
             max(1, max_len),
@@ -531,6 +537,15 @@ class AlignmentCoordination:
                 if is_temp:
                     self._remove_quietly(unalign)
 
+            chunk_cfg = (
+                ChunkConfig(
+                    min_locus_len=2200,
+                    target_chunk_len=750,
+                    adjust_direction=self._adjust_direction(),
+                )
+                if n_seq >= 50
+                else ChunkConfig(adjust_direction=self._adjust_direction())
+            )
             try_chunks = want_subdivide(
                 mode=subdivide_mode,
                 alphabet="nucl",
@@ -539,12 +554,13 @@ class AlignmentCoordination:
                 is_mafft=self._is_mafft(),
                 adjust_direction=self._adjust_direction(),
                 strategy=strategy,
+                config=chunk_cfg,
             )
             if try_chunks:
                 plan_chunks, reason = plan_chunks_with_reason(
                     unalign,
                     "nucl",
-                    ChunkConfig(adjust_direction=self._adjust_direction()),
+                    chunk_cfg,
                     name=region,
                 )
                 if plan_chunks is not None:
@@ -734,7 +750,9 @@ class AlignmentCoordination:
         plan = self._ensure_plan(region_summary, alphabet="nucl")
         support = self._aligner_support()
         regions = self._regions_to_align(target_regions)
-        preferred = water_fill_preferences(region_summary, regions, plan.cpu_budget)
+        preferred = water_fill_preferences(
+            region_summary, regions, plan.cpu_budget, alphabet="nucl"
+        )
         log.info(
             "conducting multiple sequence alignments based on nucleotide sequence"
             f" data using {plan.cpu_budget} threads ({plan.workers} workers)"
@@ -785,8 +803,13 @@ class AlignmentCoordination:
         work = work_for_locus(summary_entry, alphabet="prot")
         bytes_est = unaligned_bytes_estimate(summary_entry)
         cap = max(1, int(plan.threads_per_task_cap))
-        pref = max(1, min(int(preferred), cap))
-        max_threads = cap if support.get("threads") else 1
+        can_thread = bool(support.get("threads")) and not (
+            self._is_mafft()
+            and strategy.uses_parttree
+            and not strategy.needs_fragment_split
+        )
+        pref = max(1, min(int(preferred), cap)) if can_thread else 1
+        max_threads = cap if can_thread else 1
         est_mem = plan.est_mem_bytes(
             max(1, n_seq),
             max(1, max_len),
@@ -822,6 +845,14 @@ class AlignmentCoordination:
                 if prot_is_temp:
                     self._remove_quietly(out_aligned_prot)
 
+            chunk_cfg = (
+                ChunkConfig(
+                    min_locus_len_prot=1400,
+                    target_chunk_len_prot=550,
+                )
+                if n_seq >= 50
+                else ChunkConfig()
+            )
             try_chunks = want_subdivide(
                 mode=subdivide_mode,
                 alphabet="prot",
@@ -830,13 +861,14 @@ class AlignmentCoordination:
                 is_mafft=self._is_mafft(),
                 adjust_direction=False,
                 strategy=strategy,
+                config=chunk_cfg,
             )
             chunk_reason = "subdivide_skipped"
             if try_chunks:
                 plan_chunks, reason = plan_chunks_with_reason(
                     unalign_prot,
                     "prot",
-                    ChunkConfig(),
+                    chunk_cfg,
                     name=region,
                 )
                 if plan_chunks is not None:
@@ -1075,7 +1107,9 @@ class AlignmentCoordination:
         plan = self._ensure_plan(region_summary, alphabet="prot")
         support = self._aligner_support()
         regions = self._regions_to_align(target_regions)
-        preferred = water_fill_preferences(region_summary, regions, plan.cpu_budget)
+        preferred = water_fill_preferences(
+            region_summary, regions, plan.cpu_budget, alphabet="prot"
+        )
         log.info(
             " conducting multiple sequence alignments based on protein sequence"
             " data, followed by back-translation to nucleotides using"
@@ -1484,14 +1518,22 @@ class BackTranslation:
 
         seq = []
         nuc = str(ungapped_nucleotide)
-        gap_codon = self.gap * 3
-        for amino_acid in protein_seq:
-            if amino_acid == self.gap:
-                seq.append(gap_codon)
+        protein_str = str(protein_seq)
+        gap_char = self.gap
+        gap_codon = gap_char * 3
+        esc_gap = re.escape(gap_char)
+        run_pat = re.compile(f"{esc_gap}+|[^{esc_gap}]+")
+        pos = 0
+        for match in run_pat.finditer(protein_str):
+            chunk = match.group(0)
+            if chunk[0] == gap_char:
+                seq.append(gap_codon * len(chunk))
             else:
-                seq.append(nuc[:3])
-                nuc = nuc[3:]
-        if len(nuc) > 0:
+                step = 3 * len(chunk)
+                piece = nuc[pos : pos + step]
+                seq.append(piece)
+                pos += len(piece)
+        if pos < len(nuc):
             log.debug(
                 f"Nucleotide sequence for {unaligned_nucleotide_record.id} "
                 f"longer than protein {aligned_protein_record.id}"
@@ -1551,13 +1593,10 @@ class BackTranslation:
         """
         # Step 1. Load the protein alignment
         prot_align = AlignIO.read(self.prot_align_file, self.align_format)
-        # Step 2. Index the unaligned nucleotide sequences
-        nuc_dict = SeqIO.index(self.nuc_fasta_file, "fasta")
-        try:
-            # Step 3. Perform back-translation
-            nuc_align = self._backtrans_seqs(prot_align, nuc_dict)
-        finally:
-            nuc_dict.close()
+        # Step 2. Load the unaligned nucleotide sequences sequentially into memory
+        nuc_dict = SeqIO.to_dict(SeqIO.parse(self.nuc_fasta_file, "fasta"))
+        # Step 3. Perform back-translation
+        nuc_align = self._backtrans_seqs(prot_align, nuc_dict)
         log.debug(
             f"  back-translation of `{self.prot_name}` complete, "
             f"{len(nuc_align)} sequences of length {nuc_align.get_alignment_length()}"

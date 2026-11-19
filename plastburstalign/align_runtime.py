@@ -85,18 +85,32 @@ def water_fill_preferences(
     region_summary: Mapping[str, Mapping[str, int]],
     regions: Sequence[str],
     total_cores: int,
+    *,
+    alphabet: str = "nucl",
 ) -> dict[str, int]:
-    """Preferred thread widths from the legacy water-filling schedule."""
-    tasks_meta = {
-        k: (
-            int(region_summary.get(k, {}).get("count", 1) or 1),
-            int(region_summary.get(k, {}).get("max_len", 1) or 1),
+    """Preferred thread widths from the water-filling schedule.
+
+    Single-threaded MAFFT ``--parttree`` (``splittbfast``) loci are excluded
+    from the multi-core water-filling pool and pinned to 1 thread so they do
+    not steal multi-core budget from threadable ``--auto`` loci.
+    """
+    threadable_meta: dict[str, tuple[int, int]] = {}
+    prefs: dict[str, int] = {}
+    for k in regions:
+        entry = region_summary.get(k, {})
+        n = int(entry.get("count", 1) or 1)
+        max_len = int(entry.get("max_len", 1) or 1)
+        strat = strategy_for_locus(entry, alphabet=alphabet)
+        if strat.uses_parttree and not strat.needs_fragment_split:
+            prefs[k] = 1
+        else:
+            threadable_meta[k] = (n, max_len)
+    if threadable_meta:
+        solved = CoreBudgetPool.solve_water_filling_schedule(
+            threadable_meta, total_cores=max(1, int(total_cores))
         )
-        for k in regions
-    }
-    return CoreBudgetPool.solve_water_filling_schedule(
-        tasks_meta, total_cores=max(1, int(total_cores))
-    )
+        prefs.update(solved)
+    return prefs
 
 
 def strategy_for_locus(

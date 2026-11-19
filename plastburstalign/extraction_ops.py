@@ -250,8 +250,9 @@ class ExtractAndCollect:
 
         def commit(res) -> None:
             nuc_dict, prot_dict, inv_map, chunk_report = _unpack_worker_result(res)
-            self.plastid_data.add_nucleotides(nuc_dict, inv_map=inv_map)
-            self.plastid_data.add_proteins(prot_dict)
+            with self.plastid_data.store.transaction():
+                self.plastid_data.add_nucleotides(nuc_dict, inv_map=inv_map)
+                self.plastid_data.add_proteins(prot_dict)
             if chunk_report is not None:
                 report.merge(chunk_report)
 
@@ -321,11 +322,11 @@ class ExtractAndCollect:
                 )
             next_file_index += len(chunk)
 
-        # Step 2. Parallel extraction. A broken worker is isolated to its chunk;
-        # that chunk is then re-run one file at a time. Commit order stays the
-        # submission order, including across a pool restart.
+        # Step 2. Parallel extraction under a single outer transaction so NFS
+        # only syncs once at the end of extraction instead of per chunk.
         if chunk_args:
-            self._extract_chunks(chunk_args, commit)
+            with self.plastid_data.store.transaction():
+                self._extract_chunks(chunk_args, commit)
 
         if not report.ok:
             log.warning(report.summary())
@@ -1500,6 +1501,12 @@ class DataCleaning:
         summary = self.plastid_data.store.get_region_summary("nucl")
         num_taxa = getattr(self.plastid_data, "num_taxa", None)
 
+        with self.plastid_data.store.transaction():
+            self._clean_regions(summary, num_taxa)
+
+    def _clean_regions(
+        self, summary: dict[str, dict[str, int]], num_taxa: int | None
+    ) -> None:
         for feat_name, stats in summary.items():
             if self.exclude_region and feat_name in self.exclude_region:
                 log.info(f"    removing {feat_name} for being in exclusion list")

@@ -29,6 +29,10 @@ class DiskBackedFeatureStore:
         self._conn.row_factory = sqlite3.Row
         self._in_transaction = False
         self._registered_regions: set[str] = set()
+        self._active_regions: set[str] = set()
+        self._seen_keys: set[tuple[str, str, str]] = set()
+        self._region_stats: dict[tuple[str, str], list[int]] = {}
+        self._stats_complete = True
         self._init_db()
         self._local = threading.local()
 
@@ -83,18 +87,22 @@ class DiskBackedFeatureStore:
         # `idx_records_order` also serves (region_name, seq_type) lookups, so the
         # former `idx_records_lookup` index is no longer created for new databases.
         cursor.execute(
-            "CREATE INDEX IF NOT EXISTS idx_records_taxon ON"
-            " sequence_records(taxon_name, region_name);"
-        )
-        cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_records_order ON"
             " sequence_records(region_name, seq_type, file_index, id);"
         )
         self._conn.commit()
 
         # Pre-populate registered regions set from existing table
-        cursor.execute("SELECT region_name FROM regions;")
-        self._registered_regions = {row[0] for row in cursor.fetchall()}
+        cursor.execute("SELECT region_name, is_active FROM regions;")
+        rows = cursor.fetchall()
+        self._registered_regions = {row[0] for row in rows}
+        self._active_regions = {row[0] for row in rows if row[1] == 1}
+        if self._registered_regions:
+            cursor.execute(
+                "SELECT region_name, taxon_name, seq_type FROM sequence_records;"
+            )
+            self._seen_keys = {(r[0], r[1], r[2]) for r in cursor.fetchall()}
+            self._stats_complete = False
 
     @staticmethod
     def _migrate_schema(cursor: sqlite3.Cursor) -> None:
@@ -129,6 +137,22 @@ class DiskBackedFeatureStore:
         finally:
             self._in_transaction = False
 
+    def _update_region_stats(
+        self, region_name: str, seq_type: str, sequence: str
+    ) -> None:
+        seq_len = len(sequence)
+        eff_min = seq_len - (1 if sequence.endswith("*") else 0)
+        key = (region_name, seq_type)
+        entry = self._region_stats.get(key)
+        if entry is None:
+            self._region_stats[key] = [1, seq_len, eff_min]
+        else:
+            entry[0] += 1
+            if seq_len > entry[1]:
+                entry[1] = seq_len
+            if eff_min < entry[2]:
+                entry[2] = eff_min
+
     def register_region(self, region_name: str, inv_name: str | None = None) -> None:
         """Register a region maintaining first-seen insertion order with O(1) set caching."""
         if region_name in self._registered_regions:
@@ -141,13 +165,18 @@ class DiskBackedFeatureStore:
             VALUES (
                 :name,
                 :inv,
-                (SELECT COALESCE(MAX(insertion_order), 0) + 1 FROM regions),
+                :order_idx,
                 1
             );
             """,
-            {"name": region_name, "inv": inv_name},
+            {
+                "name": region_name,
+                "inv": inv_name,
+                "order_idx": len(self._registered_regions) + 1,
+            },
         )
         self._registered_regions.add(region_name)
+        self._active_regions.add(region_name)
         if not self._in_transaction:
             self._conn.commit()
 
@@ -162,31 +191,15 @@ class DiskBackedFeatureStore:
         inv_name: str | None = None,
         file_index: int = 0,
     ) -> bool:
-        """Insert a sequence record for a region and taxon.
-
-        Enforces uniqueness per (region, taxon, seq_type). Handles inverted repeat
-        deduplication when `inv_name` is provided. `file_index` is the position of
-        the source file in the ordered input file list; records are read back
-        ordered by (file_index, id). Returns True if inserted, False if skipped.
-        """
+        """Insert a sequence record for a region and taxon with O(1) RAM deduplication."""
         self.register_region(region_name, inv_name=inv_name)
 
-        if inv_name:
-            cursor = self._conn.cursor()
-            cursor.execute(
-                """
-                SELECT 1 FROM sequence_records
-                WHERE region_name = :inv_name AND taxon_name = :taxon_name AND seq_type = :seq_type
-                LIMIT 1;
-                """,
-                {
-                    "inv_name": inv_name,
-                    "taxon_name": taxon_name,
-                    "seq_type": seq_type,
-                },
-            )
-            if cursor.fetchone() is not None:
-                return False
+        if inv_name and (inv_name, taxon_name, seq_type) in self._seen_keys:
+            return False
+
+        key = (region_name, taxon_name, seq_type)
+        if key in self._seen_keys:
+            return False
 
         seq_len = len(sequence)
         cursor = self._conn.cursor()
@@ -211,6 +224,9 @@ class DiskBackedFeatureStore:
             },
         )
         inserted = cursor.rowcount > 0
+        if inserted:
+            self._seen_keys.add(key)
+            self._update_region_stats(region_name, seq_type, sequence)
         if not self._in_transaction:
             self._conn.commit()
         return inserted
@@ -222,17 +238,7 @@ class DiskBackedFeatureStore:
         inv_map: dict[str, str] | None = None,
         file_index: int = 0,
     ) -> None:
-        """Batch-insert sequence records from an extracted dictionary into SQLite.
-
-        Registers all regions upfront and bulk-inserts rows via executemany
-        to eliminate per-record SQL compile and Python method overhead.
-
-        Records are either `SeqRecord` instances or flat tuples
-        `(taxon, description, sequence)` / `(taxon, description, sequence,
-        file_index)`. The optional fourth tuple element is the position of the
-        source file in the ordered input file list; when absent, the
-        `file_index` argument is used.
-        """
+        """Batch-insert sequence records from an extracted dictionary into SQLite."""
         if not pdict:
             return
 
@@ -242,9 +248,10 @@ class DiskBackedFeatureStore:
         for feat_name in pdict.keys():
             self.register_region(feat_name, inv_name=inv_map.get(feat_name))
 
-        # 2. Vectorize rows into flat tuples
+        # 2. Vectorize rows into flat tuples with O(1) in-memory deduplication
         rows: list[tuple[str, str, str, str, str, str, int, int]] = []
         cursor = self._conn.cursor()
+        seen = self._seen_keys
 
         for feat_name, records in pdict.items():
             inv_name = inv_map.get(feat_name)
@@ -261,17 +268,14 @@ class DiskBackedFeatureStore:
                     desc = rec.description or ""
                     seq_str = str(rec.seq)
 
-                if inv_name:
-                    cursor.execute(
-                        """
-                        SELECT 1 FROM sequence_records
-                        WHERE region_name = ? AND taxon_name = ? AND seq_type = ?
-                        LIMIT 1;
-                        """,
-                        (inv_name, taxon_name, seq_type),
-                    )
-                    if cursor.fetchone() is not None:
-                        continue
+                if inv_name and (inv_name, taxon_name, seq_type) in seen:
+                    continue
+
+                key = (feat_name, taxon_name, seq_type)
+                if key in seen:
+                    continue
+                seen.add(key)
+                self._update_region_stats(feat_name, seq_type, seq_str)
 
                 rows.append(
                     (
@@ -342,6 +346,7 @@ class DiskBackedFeatureStore:
 
     def remove_region(self, region_name: str) -> None:
         """Mark a region as inactive."""
+        self._active_regions.discard(region_name)
         self._conn.execute(
             "UPDATE regions SET is_active = 0 WHERE region_name = :name;",
             {"name": region_name},
@@ -371,6 +376,15 @@ class DiskBackedFeatureStore:
         ]
 
     def get_region_summary(self, seq_type: str = "nucl") -> dict[str, dict[str, int]]:
+        if self._stats_complete:
+            out: dict[str, dict[str, int]] = {}
+            for reg in self.get_active_regions("seq"):
+                st = self._region_stats.get((reg, seq_type))
+                if st is None:
+                    out[reg] = {"count": 0, "max_len": 0, "min_len": 0}
+                else:
+                    out[reg] = {"count": st[0], "max_len": st[1], "min_len": st[2]}
+            return out
         """Return aggregated summary per active region.
 
         Keys per region: `count` (number of taxa), `max_len` (longest stored

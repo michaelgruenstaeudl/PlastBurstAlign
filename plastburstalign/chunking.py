@@ -424,6 +424,116 @@ def plan_chunks_with_reason(
         prev_ref_pos = found.ref_pos
         prev_positions = list(found.positions)
 
+    if not anchors and n_seq >= 50:
+        k_candidates: tuple[int, ...] = (6, 5) if alpha == "prot" else (9, 8, 7)
+        k_candidates = tuple(kc for kc in k_candidates if kc <= k) or (min(k, 7),)
+        q_min_chunk = min_chunk
+        q_chunks_target = n_chunks_target
+        if max_len > 2 * ref_len and ref_len >= 600:
+            q_min_chunk = max(120, min(min_chunk, ref_len // 6))
+            max_by_ref = max(2, ref_len // (q_min_chunk + 32))
+            q_chunks_target = max(
+                n_chunks_target,
+                min(6, max_by_ref, round(max_len / target)),
+            )
+        q_window = max(64, round(window * n_chunks_target / q_chunks_target))
+        sample_step = max(1, n_seq // 256)
+        sample_indices = range(0, n_seq, sample_step)
+        min_sample_hits = max(8, int(0.18 * len(sample_indices)))
+        min_full_hits = max(16, int(0.18 * n_seq))
+
+        for k_eff in k_candidates:
+            min_piece = max(7, k_eff)
+            q_anchors: list[Anchor] = []
+            q_prev_ref = 0
+            q_prev_pos = [0] * n_seq
+
+            for j in range(1, q_chunks_target):
+                ideal = round(j * ref_len / q_chunks_target)
+                lo = max(ideal - q_window, q_prev_ref + q_min_chunk)
+                hi = min(ideal + q_window, ref_len - q_min_chunk)
+                if lo > hi:
+                    continue
+                step = max(1, (hi - lo) // 120)
+                best_hits = -1
+                best_rp = -1
+                best_kmer = ""
+                for rp in range(lo, hi + 1, step):
+                    if rp + k_eff > ref_len:
+                        continue
+                    kmer = ref[rp : rp + k_eff]
+                    if not set(kmer) <= allowed or _is_low_complexity(kmer, cfg):
+                        continue
+                    if ref.find(kmer) != rp or ref.find(kmer, rp + 1) != -1:
+                        continue
+                    shits = 0
+                    for idx in sample_indices:
+                        s = upper[idx]
+                        p = s.find(kmer, q_prev_pos[idx] + min_piece)
+                        if (
+                            p != -1
+                            and s.find(kmer, p + 1) == -1
+                            and (lengths[idx] - p) >= min_piece
+                        ):
+                            shits += 1
+                    if shits > best_hits:
+                        best_hits = shits
+                        best_rp = rp
+                        best_kmer = kmer
+
+                if best_rp < 0 or best_hits < min_sample_hits:
+                    continue
+
+                positions_q: list[int] = []
+                exact_hits = 0
+                rem_ref = max(1, ref_len - q_prev_ref)
+                frac = (best_rp - q_prev_ref) / rem_ref
+                for i in range(n_seq):
+                    s = upper[i]
+                    prev_p = q_prev_pos[i]
+                    rem = lengths[i] - prev_p
+                    p = s.find(best_kmer, prev_p + min_piece)
+                    use_exact = (
+                        p != -1
+                        and s.find(best_kmer, p + 1) == -1
+                        and (lengths[i] - p) >= min_piece
+                    )
+                    if use_exact and lengths[i] > 2 * ref_len and rem >= 2 * min_piece:
+                        # Prevent chimeric/extreme-length outlier sequences from dumping
+                        # virtually all of their remaining length into a single chunk.
+                        expected_piece = frac * rem
+                        actual_piece = p - prev_p
+                        if (
+                            actual_piece < 0.35 * expected_piece
+                            or (lengths[i] - p) > 1.50 * (1.0 - frac) * rem
+                        ):
+                            use_exact = False
+                    if use_exact:
+                        positions_q.append(p)
+                        exact_hits += 1
+                    else:
+                        if rem < 2 * min_piece:
+                            positions_q.append(lengths[i])
+                        else:
+                            prop = prev_p + round(frac * rem)
+                            prop = max(
+                                prev_p + min_piece, min(lengths[i] - min_piece, prop)
+                            )
+                            positions_q.append(prop)
+
+                if exact_hits < min_full_hits:
+                    continue
+
+                q_anchors.append(
+                    Anchor(len(q_anchors), best_kmer, best_rp, tuple(positions_q))
+                )
+                q_prev_ref = best_rp
+                q_prev_pos = positions_q
+
+            if q_anchors:
+                anchors = q_anchors
+                break
+
     if not anchors:
         return None, "no collinear anchor chain (no k-mer unique in every sequence)"
 

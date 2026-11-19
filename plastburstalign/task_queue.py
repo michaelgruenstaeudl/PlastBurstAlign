@@ -419,30 +419,34 @@ class CoreBudgetPool:
             l_eff = max(1, length)
             cells = n_eff * l_eff
 
-            # Workload and core ceiling scaling:
-            # Massive loci (long sequences, high taxon count, or high cell volume)
-            # must receive multi-core allocations to prevent straggler timeouts.
-            if l_eff >= 1800 or cells >= 3.5e7 or n_eff >= 50000:
-                w = float(n_eff * (l_eff**2.4))
-                ceiling = min(8, C)
-            elif l_eff >= 1200 or cells >= 1.8e7 or n_eff >= 30000:
-                w = float(n_eff * (l_eff**2.1))
-                ceiling = min(4, C)
-            elif l_eff >= 600 or cells >= 5.0e6 or n_eff >= 10000:
-                w = float(n_eff * (l_eff**2.0))
-                ceiling = min(2, C)
+            # Empirical MAFFT --auto work metric & core ceiling scaling:
+            # Captures both O(N^1.65) tree/distance scaling and sub-quadratic
+            # O(L^1.35) effective length scaling across heuristic transitions.
+            w = float((n_eff**1.65) * (l_eff**1.35))
+            node_cap = 1 if (C == 2 and K >= 8) else (max(1, C // 2) if K >= 4 else C)
+            if l_eff >= 1500 or cells >= 1.5e6 or n_eff >= 1500:
+                base_cap = 8
+            elif l_eff >= 600 or cells >= 1.5e5 or n_eff >= 250:
+                base_cap = 4
+            elif l_eff >= 350 or cells >= 5.0e4 or n_eff >= 100:
+                base_cap = 2
             else:
-                w = float(n_eff * (l_eff**2.0))
-                ceiling = 1
+                base_cap = 1
 
             work[k] = w
-            p_max[k] = max(1, ceiling)
+            p_max[k] = max(1, min(base_cap, node_cap))
 
         total_work = sum(work.values())
         if total_work <= 0:
             return {k: 1 for k in tasks_meta}
 
-        # Sparse Workload Regime (K < C): spread idle cores across all tasks
+        w_max = max(work.values())
+        sig_works = [w for w in work.values() if w >= 0.02 * w_max]
+        active_work = sum(sig_works) if sig_works else total_work
+        ideal_makespan = active_work / C
+
+        # Sparse Workload Regime (K < C): spread idle cores across tasks,
+        # ensuring dominant stragglers retain proportional multi-core width.
         if K < C:
             work_scaled = {k: work[k] ** (1.0 / alpha) for k in work}
             sum_scaled = sum(work_scaled.values())
@@ -461,25 +465,29 @@ class CoreBudgetPool:
                         progress = True
                 if not progress:
                     break
-            while assigned > C:
-                for k in reversed(sorted_keys):
-                    if allocations[k] > 1 and assigned > C:
-                        allocations[k] -= 1
-                        assigned -= 1
-                        if assigned == C:
-                            break
+            for k in sorted_keys:
+                ratio = work[k] / ideal_makespan
+                if p_max[k] > 1 and ratio >= 0.40:
+                    allocations[k] = max(
+                        allocations[k], min(p_max[k], max(2, round(ratio * 1.4)))
+                    )
             return allocations
 
         # Dense Workload Regime (K >= C):
-        ideal_makespan = total_work / C
+        # Allocate proportional multi-core width to every locus whose single-thread
+        # work exceeds 28% of ideal_makespan so top loci run concurrently at t=0
+        # without starving mid-length introns and core full-taxon spacers.
         allocations = {k: 1 for k in work}
         for k in work:
-            if p_max[k] > 1 and (
-                work[k] > (1.2 * ideal_makespan)
-                or tasks_meta[k][0] >= 30000
-                or (tasks_meta[k][0] * tasks_meta[k][1]) >= 2.0e7
-            ):
-                allocations[k] = p_max[k]
+            if p_max[k] > 1:
+                ratio = work[k] / ideal_makespan
+                if ratio >= 0.28:
+                    allocations[k] = min(p_max[k], max(2, round(ratio * 1.6)))
+                elif (
+                    tasks_meta[k][0] >= 30000
+                    or (tasks_meta[k][0] * tasks_meta[k][1]) >= 2.5e6
+                ):
+                    allocations[k] = p_max[k]
         return allocations
 
     @staticmethod
