@@ -22,8 +22,8 @@ PlastBurstAlign deconstructs complete plastomes into protein-coding sequences, t
 - Aligns coding sequences via translated amino acids and nucleotide back-translation, whereas RNA, intron, and spacer sequences are aligned as nucleotides.
 - Supports MAFFT, MUSCLE, and Clustal Omega out of the box; additional command-line aligners can be configured via YAML.
 - Writes individual and optional concatenated alignments in FASTA/NEXUS, ordering concatenated markers alphabetically or by feature order in the first genome.
-- Runs marker alignments concurrently and allocates more threads to higher-cost alignments when supported, reducing runtime.
-- Implements disk-backed sequence storage and a bounded task queue to limit memory use. 
+- ⭐ Runs marker alignments concurrently and allocates more threads to higher-cost alignments when supported, reducing runtime.
+- ⭐ Implements disk-backed sequence storage and a bounded task queue to limit memory use.
 - Logs progress, warnings, and failures, with extra verbose diagnostics.
 
 ---
@@ -34,9 +34,15 @@ See the [Installation page on the GitHub Wiki](https://github.com/michaelgruenst
 
 ---
 
-### Command-line parameters
+### Quick start
 
-See the [Command-line parameters section on the GitHub Wiki](https://github.com/michaelgruenstaeudl/PlastBurstAlign/wiki/Command%E2%80%90line-parameters#command-line-parameters) for the available options and examples.
+After installing PlastBurstAlign and MAFFT, place complete GenBank `.gb` files in an input directory and run:
+
+```bash
+plastburstalign -i Input_dataset -o Output_cds -s cds -c
+```
+
+This extracts and aligns coding sequences, then writes concatenated FASTA and NEXUS files to the output directory.
 
 ---
 
@@ -58,6 +64,6 @@ Use a separate output directory for each run; it and its subfolders are created 
 
 ---
 
-### Benchmarking
+### Command-line parameters
 
-See the [Benchmarking section on the GitHub Wiki](https://github.com/michaelgruenstaeudl/PlastBurstAlign/wiki/Benchmarking#benchmarking-datasets) for benchmark datasets, usage, and preparation details.
+See the [Command-line parameters section on the GitHub Wiki](https://github.com/michaelgruenstaeudl/PlastBurstAlign/wiki/Command%E2%80%90line-parameters#command-line-parameters) for the available options and examples.
