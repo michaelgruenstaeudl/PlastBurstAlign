@@ -137,11 +137,17 @@ class DiskBackedFeatureStore:
         finally:
             self._in_transaction = False
 
+    _NUCL_NON_PARTTREE = str.maketrans("", "", "*-.?NnRrYyKkMmSsWwBbDdHhVvXx \t\r\n")
+    _PROT_NON_PARTTREE = str.maketrans("", "", "*-.?Xx \t\r\n")
+
     def _update_region_stats(
         self, region_name: str, seq_type: str, sequence: str
     ) -> None:
         seq_len = len(sequence)
-        eff_min = seq_len - (1 if sequence.endswith("*") else 0)
+        non_pt = (
+            self._PROT_NON_PARTTREE if seq_type == "prot" else self._NUCL_NON_PARTTREE
+        )
+        eff_min = len(sequence.translate(non_pt))
         key = (region_name, seq_type)
         entry = self._region_stats.get(key)
         if entry is None:
@@ -376,6 +382,15 @@ class DiskBackedFeatureStore:
         ]
 
     def get_region_summary(self, seq_type: str = "nucl") -> dict[str, dict[str, int]]:
+        if not self._stats_complete:
+            cursor = self._conn.cursor()
+            cursor.execute(
+                "SELECT region_name, seq_type, sequence FROM sequence_records;"
+            )
+            self._region_stats.clear()
+            for r_name, s_type, seq in cursor:
+                self._update_region_stats(r_name, s_type, seq)
+            self._stats_complete = True
         if self._stats_complete:
             out: dict[str, dict[str, int]] = {}
             for reg in self.get_active_regions("seq"):

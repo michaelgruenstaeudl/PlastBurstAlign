@@ -118,6 +118,9 @@ def run_aligner_subprocess(
 
 #: Translation table dropping everything that is not a residue (stop, gaps, space).
 _NON_RESIDUES = str.maketrans("", "", "*-. \t\r\n")
+#: Characters ignored by MAFFT's PartTree 6-mer tuple counter in nucleotide / protein mode.
+_NUCL_NON_PARTTREE = str.maketrans("", "", "*-.?NnRrYyKkMmSsWwBbDdHhVvXx \t\r\n")
+_PROT_NON_PARTTREE = str.maketrans("", "", "*-.?Xx \t\r\n")
 
 # Resolver kinds understood by ``get_alignment_tool``. ``generic`` / unknown
 # names stay on ``GenericAlignmentTool`` and never fall through to the builtin.
@@ -375,13 +378,18 @@ class MAFFT(AlignmentTool):
         without parsing BioPython objects. Excludes stop asterisks (*), gaps (-, .),
         and whitespace. Returns (record_count, min_seq_length, max_seq_length)."""
         count = 0
-        min_len = float("inf")
+        min_len_prot = float("inf")
+        min_len_nucl = float("inf")
         max_len = 0
-        curr_len = 0
+        curr_max_len = 0
+        curr_min_prot = 0
+        curr_min_nucl = 0
         in_seq = False
-        non_residues = bytes(
-            [42, 32, 9, 13, 10, 45, 46]
-        )  # ASCII for * space \t \r \n - .
+        non_residues = b"* \t\r\n-."
+        non_pt_prot = b"* \t\r\n-.?Xx"
+        non_pt_nucl = b"* \t\r\n-.?NnRrYyKkMmSsWwBbDdHhVvXx"
+        prot_only = b"EFILPQZJefilpqzj"
+        is_prot = os.path.basename(str(input_file)).startswith("prot_")
         try:
             with open(input_file, "rb") as f:
                 for line in f:
@@ -391,22 +399,35 @@ class MAFFT(AlignmentTool):
                     if line.startswith(b">"):
                         count += 1
                         if in_seq:
-                            if curr_len < min_len:
-                                min_len = curr_len
-                            if curr_len > max_len:
-                                max_len = curr_len
-                            curr_len = 0
+                            if curr_min_prot < min_len_prot:
+                                min_len_prot = curr_min_prot
+                            if not is_prot and curr_min_nucl < min_len_nucl:
+                                min_len_nucl = curr_min_nucl
+                            if curr_max_len > max_len:
+                                max_len = curr_max_len
+                            curr_max_len = 0
+                            curr_min_prot = 0
+                            curr_min_nucl = 0
                         in_seq = True
                     else:
-                        cleaned = line.translate(None, non_residues)
-                        curr_len += len(cleaned)
+                        if not is_prot and len(line.translate(None, prot_only)) != len(
+                            line
+                        ):
+                            is_prot = True
+                        curr_max_len += len(line.translate(None, non_residues))
+                        curr_min_prot += len(line.translate(None, non_pt_prot))
+                        if not is_prot:
+                            curr_min_nucl += len(line.translate(None, non_pt_nucl))
                 if in_seq:
-                    if curr_len < min_len:
-                        min_len = curr_len
-                    if curr_len > max_len:
-                        max_len = curr_len
+                    if curr_min_prot < min_len_prot:
+                        min_len_prot = curr_min_prot
+                    if not is_prot and curr_min_nucl < min_len_nucl:
+                        min_len_nucl = curr_min_nucl
+                    if curr_max_len > max_len:
+                        max_len = curr_max_len
         except OSError:
             pass
+        min_len = min_len_prot if is_prot else min_len_nucl
         if min_len == float("inf"):
             min_len = 0
         return count, int(min_len), int(max_len)
@@ -683,9 +704,20 @@ class MAFFT(AlignmentTool):
         main: list[int] = []
         short: list[int] = []
         empty: list[int] = []
+        non_pt = _PROT_NON_PARTTREE if alphabet == "prot" else _NUCL_NON_PARTTREE
+        has_ambiguous_short = False
         for i, (_, seq) in enumerate(records):
-            n_res = len(seq.translate(_NON_RESIDUES))
-            (empty if n_res == 0 else short if n_res < min_ok else main).append(i)
+            cleaned = seq.translate(_NON_RESIDUES)
+            n_res = len(cleaned)
+            n_pt = len(cleaned.translate(non_pt))
+            if n_res == 0:
+                empty.append(i)
+            elif n_pt < min_ok:
+                short.append(i)
+                if n_pt != n_res:
+                    has_ambiguous_short = True
+            else:
+                main.append(i)
 
         if len(main) < 2:
             cap = int(
@@ -755,7 +787,11 @@ class MAFFT(AlignmentTool):
                         "addfragments_max_n", DEFAULT_CONSTANTS.addfragments_max_n
                     )
                 )
-                add_flag = "--addfragments" if len(main) <= cap_add else "--add"
+                add_flag = (
+                    "--add"
+                    if (len(main) > cap_add or has_ambiguous_short)
+                    else "--addfragments"
+                )
                 target_main_aln = main_aln
                 max_rep_n = 256
                 if add_flag == "--add" and len(main) > max_rep_n:

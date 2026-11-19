@@ -294,6 +294,44 @@ class FragmentPathTests(unittest.TestCase):
         self.assertTrue(mafft.align(src, out, threads=2))
         self.assert_alignment_of(records, out)
 
+    def test_ambiguous_n_scaffolds_route_to_short_add_path(self) -> None:
+        """All-N and <6-informative-base sequences must bypass PartTree main.fa and use --add."""
+        from plastburstalign.storage import DiskBackedFeatureStore
+
+        records = self.locus(n_long=10, alphabet="nucl", seed=19) + [
+            ("all_n_scaffold", "n" * 64),
+            ("two_base_n_scaffold", "n" * 20 + "ac" + "n" * 20),
+        ]
+        src = self.path("nucl_n_scaffold.fasta")
+        out = self.path("nucl_n_scaffold.aln")
+        write_fasta(src, records)
+
+        store = DiskBackedFeatureStore()
+        for hdr, seq in records:
+            store.add_record("igs_n", hdr, "nucl", hdr, hdr, seq)
+        summary = store.get_region_summary("nucl")["igs_n"]
+        self.assertEqual(summary["min_len"], 0)
+
+        n_seq, min_l, max_l = MAFFT._scan_fasta_meta(src)
+        self.assertEqual((n_seq, min_l, max_l), (len(records), 0, summary["max_len"]))
+
+        mafft = self.aligner()
+        ok = mafft.align(
+            src,
+            out,
+            threads=1,
+            sequence_count=summary["count"],
+            max_len=summary["max_len"],
+            min_len=summary["min_len"],
+            alphabet="nucl",
+        )
+        self.assertTrue(ok)
+        aligned = read_fasta(out)
+        self.assertEqual([h for h, _ in aligned], [h for h, _ in records])
+        self.assertEqual({len(s) for _, s in aligned}, {len(aligned[0][1])})
+        for (_, orig), (_, aln) in zip(records, aligned):
+            self.assertEqual(aln.replace("-", "").lower(), orig.lower())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -545,16 +545,26 @@ def plan_chunks_with_reason(
         cuts.append(tuple(bounds))
 
     n_chunks = len(anchors) + 1
+    non_pt = (
+        str.maketrans("", "", "*-.?Xx \t\r\n")
+        if alpha == "prot"
+        else str.maketrans("", "", "*-.?NnRrYyKkMmSsWwBbDdHhVvXx \t\r\n")
+    )
     specs: list[ChunkSpec] = []
     for c in range(n_chunks):
         piece_lens = [b[c + 1] - b[c] for b in cuts]
         non_empty = [x for x in piece_lens if x > 0]
+        inf_lens = [
+            len(seqs[i][b[c] : b[c + 1]].translate(non_pt))
+            for i, b in enumerate(cuts)
+            if b[c + 1] > b[c]
+        ]
         specs.append(
             ChunkSpec(
                 index=c,
                 n_seq=len(non_empty),
                 n_empty=n_seq - len(non_empty),
-                min_len=min(non_empty) if non_empty else 0,
+                min_len=min(inf_lens) if inf_lens else 0,
                 max_len=max(non_empty) if non_empty else 0,
                 needs_alignment=len(non_empty) >= 2,
             )

@@ -600,6 +600,28 @@ class ChunkingTimingReport(unittest.TestCase):
                 f"splice {splice:.3f}s\n"
             )
 
+    def test_chunk_slice_with_all_n_reports_zero_informative_min_len(self) -> None:
+        """A non-empty chunk slice containing only ambiguity N bases must set min_len=0."""
+        recs = simulated(n=12, length=1800, seed=7)
+        base_plan = plan_chunks(
+            recs, name="nucl_n_chunk", alphabet="nucl", config=SMALL
+        )
+        self.assertIsNotNone(base_plan)
+        assert base_plan is not None
+        cut = base_plan.cuts[-1][1]
+        hdr, seq = recs[-1]
+        recs[-1] = (hdr, ("n" * cut) + seq[cut:])
+        plan, reason = plan_chunks_with_reason(
+            recs,
+            name="nucl_n_chunk",
+            alphabet="nucl",
+            config=SMALL,
+        )
+        self.assertIsNotNone(plan, reason)
+        assert plan is not None
+        self.assertEqual(plan.chunks[0].min_len, 0)
+        self.assertGreaterEqual(plan.chunks[0].max_len, cut)
+
 
 if __name__ == "__main__":
     unittest.main()
