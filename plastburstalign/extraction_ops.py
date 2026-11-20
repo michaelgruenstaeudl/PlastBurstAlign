@@ -570,7 +570,7 @@ class ExtractAndCollect:
         ) -> None:
             report.files_total += 1
             try:
-                log.info(f" parsing {os.path.basename(file)}")
+                log.debug(f" parsing {os.path.basename(file)}")
                 record = fast_read_genbank(file)
             except GenBankParseError as exc:
                 report.add_file_failure(file, exc.stage, exc.reason, file_index)
@@ -1059,13 +1059,13 @@ class ExonSpliceHandler:
         of the compound location. All of these simple location features are inserted (or merged) into their
         expected location in the gene list.
         """
-        log.info(
+        log.debug(
             f"  resolving genes with compound locations in {self.feat_rearr.rec_name}"
         )
-        log.info(f"   resolving cis-spliced genes in {self.feat_rearr.rec_name}")
+        log.debug(f"   resolving cis-spliced genes in {self.feat_rearr.rec_name}")
         merger = ExonSpliceMerger(self.feat_rearr)
         merger.merge()
-        log.info(f"   resolving trans-spliced genes in {self.feat_rearr.rec_name}")
+        log.debug(f"   resolving trans-spliced genes in {self.feat_rearr.rec_name}")
         insertor = ExonSpliceInsertor(self.feat_rearr)
         insertor.insert()
 
@@ -1529,7 +1529,7 @@ class DataCleaning:
                     raise AttributeError(
                         "Total number of taxa is unavailable for frequency filtering"
                     )
-                if (count / num_taxa) < self.min_num_taxa:
+                if count < 2 or (count / num_taxa) < self.min_num_taxa:
                     log.info(
                         f"    removing {feat_name} for not reaching the minimum relative frequency of taxa defined"
                     )

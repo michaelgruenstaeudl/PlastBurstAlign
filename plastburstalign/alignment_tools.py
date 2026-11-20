@@ -782,6 +782,7 @@ class MAFFT(AlignmentTool):
             aligned_path = main_aln
             subsampled_main_rows: dict[str, str] | None = None
             if short:
+                max_rep_n = 256
                 cap_add = int(
                     self.tool_params.get(
                         "addfragments_max_n", DEFAULT_CONSTANTS.addfragments_max_n
@@ -789,11 +790,10 @@ class MAFFT(AlignmentTool):
                 )
                 add_flag = (
                     "--add"
-                    if (len(main) > cap_add or has_ambiguous_short)
+                    if (len(main) > min(cap_add, max_rep_n) or has_ambiguous_short)
                     else "--addfragments"
                 )
                 target_main_aln = main_aln
-                max_rep_n = 256
                 if add_flag == "--add" and len(main) > max_rep_n:
                     subsampled_main_rows = _read_aligned_fasta(main_aln)
                     w_main = len(next(iter(subsampled_main_rows.values()), ""))
@@ -945,6 +945,17 @@ class MAFFT(AlignmentTool):
         # kwargs may carry timeout from generic plumbing
         if timeout is None and kwargs.get("timeout") is not None:
             timeout = float(kwargs["timeout"])
+
+        # Short-circuit single-sequence inputs (MAFFT requires >= 2 sequences and exits rc=1 on N=1)
+        if sequence_count == 1:
+            recs = _read_fasta_records(input_file)
+            if len(recs) == 1:
+                os.makedirs(
+                    os.path.dirname(os.path.abspath(output_file)), exist_ok=True
+                )
+                with open(output_file, "w", encoding="utf-8") as handle:
+                    _write_wrapped(handle, recs[0][0], recs[0][1])
+                return True
 
         try:
             alpha = self._detect_alphabet(input_file, alphabet)

@@ -506,13 +506,16 @@ class AlignmentCoordination:
         work = work_for_locus(summary_entry, alphabet="nucl")
         bytes_est = unaligned_bytes_estimate(summary_entry)
         cap = max(1, int(plan.threads_per_task_cap))
-        can_thread = bool(support.get("threads")) and not (
+        is_pure_parttree = (
             self._is_mafft()
             and strategy.uses_parttree
             and not strategy.needs_fragment_split
         )
+        can_thread = bool(support.get("threads")) and not is_pure_parttree
         pref = max(1, min(int(preferred), cap)) if can_thread else 1
-        max_threads = cap if can_thread else 1
+        max_threads = (
+            cap if can_thread else (min(cap, 4) if bool(support.get("threads")) else 1)
+        )
         est_mem = plan.est_mem_bytes(
             max(1, n_seq),
             max(1, max_len),
@@ -539,7 +542,7 @@ class AlignmentCoordination:
 
             chunk_cfg = (
                 ChunkConfig(
-                    min_locus_len=2200,
+                    min_locus_len=1500,
                     target_chunk_len=750,
                     adjust_direction=self._adjust_direction(),
                 )
@@ -803,13 +806,16 @@ class AlignmentCoordination:
         work = work_for_locus(summary_entry, alphabet="prot")
         bytes_est = unaligned_bytes_estimate(summary_entry)
         cap = max(1, int(plan.threads_per_task_cap))
-        can_thread = bool(support.get("threads")) and not (
+        is_pure_parttree = (
             self._is_mafft()
             and strategy.uses_parttree
             and not strategy.needs_fragment_split
         )
+        can_thread = bool(support.get("threads")) and not is_pure_parttree
         pref = max(1, min(int(preferred), cap)) if can_thread else 1
-        max_threads = cap if can_thread else 1
+        max_threads = (
+            cap if can_thread else (min(cap, 4) if bool(support.get("threads")) else 1)
+        )
         est_mem = plan.est_mem_bytes(
             max(1, n_seq),
             max(1, max_len),

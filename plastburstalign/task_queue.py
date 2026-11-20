@@ -420,13 +420,40 @@ class CoreBudgetPool:
             cells = n_eff * l_eff
 
             # Empirical MAFFT --auto work metric & core ceiling scaling:
-            # Captures both O(N^1.65) tree/distance scaling and sub-quadratic
-            # O(L^1.35) effective length scaling across heuristic transitions.
-            w = float((n_eff**1.65) * (l_eff**1.35))
+            # Accounts for non-monotonic algorithmic cliffs in MAFFT --auto:
+            #   N < 100, L < 3000  -> L-INS-i  (--localpair --maxiterate 1000)
+            #   N < 200, L < 1000  -> L-INS-2  (--localpair --maxiterate 2)
+            #   N < 500, L < 10000 -> FFT-NS-i (--retree 2 --maxiterate 2)
+            #   N >= 500           -> FFT-NS-2 (--retree 2 --maxiterate 0)
+            nf, lf = float(n_eff), float(l_eff)
+            base_prog = (nf**1.65) * (lf**1.35)
+            if n_eff < 100 and l_eff < 3000:
+                # L-INS-i: pairlocalalign O(N^2 * L^2) + up to 1000 refinement passes
+                w = max(base_prog, 1.5 * nf * nf * lf * lf)
+            elif n_eff < 200 and l_eff < 1000:
+                # L-INS-2: pairlocalalign O(N^2 * L^2) + 2 refinement passes
+                w = max(base_prog, 0.8 * nf * nf * lf * lf)
+            elif n_eff < 500 and l_eff < 10000:
+                # FFT-NS-i: progressive + iterative refinement
+                w = base_prog * 25.0
+            else:
+                # FFT-NS-2 (N >= 500): fast progressive, zero iterative refinement
+                w = base_prog
+
             node_cap = 1 if (C == 2 and K >= 8) else (max(1, C // 2) if K >= 4 else C)
-            if l_eff >= 1500 or cells >= 1.5e6 or n_eff >= 1500:
+            if (
+                l_eff >= 1500
+                or cells >= 1.5e6
+                or n_eff >= 1500
+                or (n_eff < 100 and l_eff >= 1000)
+            ):
                 base_cap = 8
-            elif l_eff >= 600 or cells >= 1.5e5 or n_eff >= 250:
+            elif (
+                l_eff >= 600
+                or cells >= 1.5e5
+                or n_eff >= 250
+                or (n_eff < 200 and l_eff >= 400)
+            ):
                 base_cap = 4
             elif l_eff >= 350 or cells >= 5.0e4 or n_eff >= 100:
                 base_cap = 2

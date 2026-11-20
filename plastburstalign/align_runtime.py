@@ -19,7 +19,6 @@ from .strategy import (
     AlignmentStrategy,
     AlignmentTier,
     determine_alignment_strategy,
-    estimate_work,
 )
 from .task_queue import CoreBudgetPool
 
@@ -142,7 +141,32 @@ def work_for_locus(summary_entry: Mapping[str, int], *, alphabet: str) -> float:
     max_len = int(summary_entry.get("max_len", 0) or 0)
     if n <= 0 or max_len <= 0:
         return 1.0
-    return float(estimate_work(n, max_len, alphabet=alphabet))
+    from .strategy import estimate_work_terms
+
+    terms = estimate_work_terms(n, max_len, alphabet=alphabet)
+    strat = strategy_for_locus(summary_entry, alphabet=alphabet)
+    nf, lf = float(n), float(max_len)
+    if strat.tier is AlignmentTier.ACCURATE:
+        # Calibrated 1-core work units (~1e9 units per second on Xeon/EPYC):
+        #   N < 100, L < 3000  -> L-INS-i  (pairlocalalign O(N^2 L^2) + maxiterate 1000)
+        #   N < 200, L < 1000  -> L-INS-2  (pairlocalalign O(N^2 L^2) + maxiterate 2)
+        #   N < 500, L < 10000 -> FFT-NS-i (progressive + consistency refinement)
+        #   N >= 500           -> FFT-NS-2 (fast 6-mer + progressive, 0 iterations)
+        if n < 100 and max_len < 3000:
+            return max(terms.total, 12.0 * nf * nf * lf * lf)
+        if n < 200 and max_len < 1000:
+            return max(terms.total, 7.5 * nf * nf * lf * lf)
+        if n < 500 and max_len < 10000:
+            return terms.total * 40.0
+        return terms.total
+    # PartTree tiers skip the O(N^2 * L) all-vs-all matrix; runtime follows the
+    # progressive term (damped by --nofft / --retree 1).
+    tier_scale = {
+        AlignmentTier.FAST_TREE: 0.75,
+        AlignmentTier.HIGH_SCALE: 0.55,
+        AlignmentTier.EXTREME_SCALE: 0.40,
+    }.get(strat.tier, 0.5)
+    return max(1.0, terms.primary * tier_scale)
 
 
 def unaligned_bytes_estimate(summary_entry: Mapping[str, int]) -> int:
@@ -175,10 +199,11 @@ def want_subdivide(
         return max_len >= 2  # still needs a valid anchor chain at plan time
     if max_len < min_len:
         return False
-    # auto: only when full-locus --auto would stay in the FFT regime, so pinning
-    # chunks does not silently upgrade them to L-INS-i.
+    # auto: pin_algorithm_args already pins the parent locus's explicit MAFFT flags
+    # on every chunk, so chunking a long L-INS-i or FFT-NS-i locus never changes its
+    # algorithm regime and cuts quadratic O(L^2) alignment cost across chunks.
     if strategy.tier is AlignmentTier.ACCURATE:
-        return mafft_auto_is_fft(n_seq, max_len)
+        return mafft_auto_is_fft(n_seq, max_len) or (n_seq >= 50 and max_len >= min_len)
     return True
 
 
