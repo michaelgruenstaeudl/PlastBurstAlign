@@ -126,6 +126,9 @@ class CanonicalizationTests(unittest.TestCase):
         self.assertEqual(gate.diff_mode("cds", base, base), [])
 
 
+@unittest.skipIf(
+    bool(os.environ.get("PBA_FORCE_BUILTIN_ALIGNER")), "builtin aligner forced"
+)
 @unittest.skipUnless(shutil.which("mafft"), "mafft not available")
 @unittest.skipUnless(gate.DEFAULT_DATASET.is_dir(), "Asteraceae dataset not present")
 @unittest.skipUnless(gate.DEFAULT_GOLDEN.is_file(), "golden parity file missing")
