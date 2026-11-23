@@ -1,19 +1,103 @@
 import os
 from collections import OrderedDict, defaultdict
 from re import IGNORECASE, findall, match, sub
+from re import compile as re_compile
 from typing import Any, ClassVar, Optional
-import re
+
 from Bio import SeqUtils
 from Bio.Data import CodonTable
 from Bio.Seq import Seq
-from Bio.SeqFeature import ExactPosition, FeatureLocation, SeqFeature
+from Bio.SeqFeature import CompoundLocation, ExactPosition, FeatureLocation, SeqFeature
 from Bio.SeqRecord import SeqRecord
 
+from .extraction_report import ExtractionReport
 from .logging_ops import logger as log
 from .storage import DiskBackedFeatureStore, FeatureStoreView
+from .user_parameters import SelectMode
+
+# Anything outside the IUPAC nucleotide alphabet cannot be aligned: such a feature
+# is skipped (and reported) instead of poisoning its region.
+_INVALID_RESIDUES = re_compile(r"[^ACGTURYSWKMBDHVNacgturyswkmbdhvn]")
+# Region names become file names; real gene names are far shorter.
+MAX_REGION_NAME_CHARS = 100
+
+
+def record_topology(record: Any) -> str | None:
+    """Read ``circular`` / ``linear`` from record annotations if present."""
+    ann = getattr(record, "annotations", None) or {}
+    topo = ann.get("topology")
+    if topo is None:
+        return None
+    text = str(topo).strip().lower()
+    if text in {"circular", "linear"}:
+        return text
+    return None
+
+
+def circular_intron_bounds(
+    exon1: Any,
+    exon2: Any,
+    parent_len: int,
+    topology: str | None = None,
+) -> FeatureLocation | CompoundLocation | None:
+    """Build the minimal-arc intron location between two exon parts.
+
+    Enforces the shortest-arc topological invariant on circular plastomes,
+    preserving transcript strand polarity and avoiding whole-genome (~150 kb)
+    slices across origin-wrapping exons.
+    """
+    try:
+        s1, e1 = int(exon1.start), int(exon1.end)
+        s2, e2 = int(exon2.start), int(exon2.end)
+        st1 = getattr(exon1, "strand", None)
+        st2 = getattr(exon2, "strand", None)
+        if st1 is not None and st2 is not None and st1 != st2:
+            return None
+        strand = st1 if st1 is not None else st2
+    except Exception:
+        return None
+
+    parent = int(parent_len)
+    max_intron = 10_000 if parent > 20_000 else max(parent, 10_000)
+
+    if s2 >= e1:
+        linear_len = s2 - e1
+        linear_coords = (e1, s2)
+        wrap_len = ((parent - e2) + s1) if parent > 0 else linear_len + 1
+        wrap_coords = ((e2, parent), (0, s1))
+    elif s1 >= e2:
+        linear_len = s1 - e2
+        linear_coords = (e2, s1)
+        wrap_len = ((parent - e1) + s2) if parent > 0 else linear_len + 1
+        wrap_coords = ((e1, parent), (0, s2))
+    else:
+        return None
+
+    if linear_len <= wrap_len:
+        if linear_len <= 0 or (parent > 0 and linear_len > max_intron):
+            return None
+        return FeatureLocation(linear_coords[0], linear_coords[1], strand=strand)
+
+    topo = (topology or "").strip().lower()
+    if topo == "linear" or parent <= 0 or wrap_len <= 0 or wrap_len > max_intron:
+        return None
+
+    part_a = FeatureLocation(wrap_coords[0][0], wrap_coords[0][1], strand=strand)
+    part_b = FeatureLocation(wrap_coords[1][0], wrap_coords[1][1], strand=strand)
+    return CompoundLocation([part_a, part_b])
 
 
 class PlastidData:
+    mode: SelectMode
+    files: list[str]
+    num_taxa: int
+    order: str
+    store: DiskBackedFeatureStore
+    nucleotides: FeatureStoreView
+    proteins: FeatureStoreView | None
+    order_map: dict[str, int]
+    extraction_report: ExtractionReport
+
     def __init__(self, user_params: dict[str, Any]):
         """
         Data structure to hold the extracted annotations.
@@ -22,6 +106,8 @@ class PlastidData:
         self._set_mode(user_params)
         self._set_files(user_params)
         self._set_order_fun(user_params)
+        # filled by `ExtractAndCollect.extract()`; empty until then
+        self.extraction_report = ExtractionReport()
 
         db_path = os.path.join(user_params.get("out_dir", "."), "feature_store.db")
         self.store = DiskBackedFeatureStore(db_path)
@@ -30,55 +116,67 @@ class PlastidData:
         self._set_proteins()
 
     def _set_mode(self, user_params: dict[str, Any]):
-        self.mode = user_params.get("select_mode")
+        self.mode = user_params.get("select_mode")  # type: ignore[assignment]
 
     def _set_nucleotides(self):
         self.nucleotides = FeatureStoreView(self.store, "nucl")
 
     def _set_proteins(self):
         self.proteins = (
-            FeatureStoreView(self.store, "prot") if self.mode.collects_proteins() else None
+            FeatureStoreView(self.store, "prot")
+            if self.mode.collects_proteins()
+            else None
         )
 
     def _set_files(self, user_params: dict[str, Any]):
+        """Collects the input files in a deterministic (sorted by name) order.
+
+        `os.listdir` order is filesystem dependent; the position of a file in this
+        list becomes the `file_index` of its records and thereby the row order of
+        every alignment and of the concatenated supermatrix.
+
+        Cluster worker and finalizer runs operate on the existing feature store
+        only, so a missing input directory is tolerated there.
+        """
+        in_dir = user_params.get("in_dir")
+        is_cluster_worker_or_final = (
+            user_params.get("align_partition") is not None
+            or user_params.get("finalize_slurm") is True
+        )
+        try:
+            names = os.listdir(in_dir)
+        except OSError:
+            if not is_cluster_worker_or_final:
+                raise
+            names = []
+        fileext = user_params.get("fileext")
         self.files = [
-            os.path.join(user_params.get("in_dir"), f)
-            for f in os.listdir(user_params.get("in_dir"))
-            if f.endswith(user_params.get("fileext"))
+            os.path.join(in_dir, f) for f in sorted(names) if f.endswith(fileext)
         ]
         self.num_taxa = len(self.files)
 
     def _set_order_fun(self, user_params: dict[str, Any]):
         self.order = user_params.get("order")
 
-    def add_nucleotides(self, pdict: "PlastidDict"):
+    def add_nucleotides(
+        self, pdict: Any, inv_map: dict[str, str] | None = None
+    ) -> None:
         """Merges extracted dictionary into the disk store."""
-        is_igs = isinstance(pdict, IntergenicDict)
-        inv_map = getattr(pdict, "feat_name_inv_map", {})
-
-        for feat_name, records in pdict.items():
-            inv_name = inv_map.get(feat_name) if is_igs else None
-            for rec in records:
-                self.store.add_seqrecord(
-                    region_name=feat_name,
-                    taxon_name=str(rec.id),
-                    seq_type="nucl",
-                    record=rec,
-                    inv_name=inv_name,
-                )
-
-    def add_proteins(self, pdict: "PlastidDict"):
-        """Merges extracted proteins into the disk store."""
-        if not self.mode.collects_proteins():
+        if not pdict:
             return
-        for feat_name, records in pdict.items():
-            for rec in records:
-                self.store.add_seqrecord(
-                    region_name=feat_name,
-                    taxon_name=str(rec.id),
-                    seq_type="prot",
-                    record=rec,
-                )
+        if inv_map is None:
+            is_igs = isinstance(pdict, IntergenicDict)
+            inv_map = getattr(pdict, "feat_name_inv_map", {}) if is_igs else None
+
+        with self.store.transaction():
+            self.store.add_pdict(pdict, seq_type="nucl", inv_map=inv_map)
+
+    def add_proteins(self, pdict: Any) -> None:
+        """Merges extracted proteins into the disk store."""
+        if not pdict or not self.mode.collects_proteins():
+            return
+        with self.store.transaction():
+            self.store.add_pdict(pdict, seq_type="prot", inv_map=None)
 
     def set_order_map(self):
         order_list = self.store.get_active_regions(self.order)
@@ -225,7 +323,9 @@ class GeneNameCleaner:
         """
         return feat.qualifiers["gene"][0] if feat.qualifiers.get("gene") else None
 
-    def clean_trna_gene(self, gene: Optional[str], cut_trna: bool = False) -> Optional[str]:
+    def clean_trna_gene(
+        self, gene: Optional[str], cut_trna: bool = False
+    ) -> Optional[str]:
         """
         Standardizes a tRNA gene name by case, delimiter usage, and anticodon.
         If there is no initial gene name (`None`), `None` will be returned.
@@ -239,18 +339,12 @@ class GeneNameCleaner:
         # trnVUAC -> trnV_UAC
         # trnVTAC -> trnV_UAC
         attached_anticodon = match(
-            r"^(trn[A-Za-z])([ACGTUacgtu]{3})$",
-            gene,
-            flags=IGNORECASE
+            r"^(trn[A-Za-z])([ACGTUacgtu]{3})$", gene, flags=IGNORECASE
         )
 
         if attached_anticodon:
-            base_gene = (
-                "trn" + attached_anticodon.group(1)[3].upper()
-            )
-            anticodon = (
-                attached_anticodon.group(2).upper().replace("T", "U")
-            )
+            base_gene = "trn" + attached_anticodon.group(1)[3].upper()
+            anticodon = attached_anticodon.group(2).upper().replace("T", "U")
             return base_gene if cut_trna else f"{base_gene}_{anticodon}"
 
         # Look for standardized gene name
@@ -260,16 +354,13 @@ class GeneNameCleaner:
         if not gene_sub:
             return sub(r"\W+", "_", gene.replace("-", "_"))
 
-        cleaned_gene = (
-            gene_sub.group()[0:3].lower()
-            + gene_sub.group()[3:].upper()
-        )
+        cleaned_gene = gene_sub.group()[0:3].lower() + gene_sub.group()[3:].upper()
 
         if cut_trna:
             return cleaned_gene
 
         # Look for tRNA qualifiers
-        gene = gene[len(gene_sub.group()):]
+        gene = gene[len(gene_sub.group()) :]
         trna_pattern = r"([a-zA-Z]{3})"
         qual_subs = findall(trna_pattern, gene)
 
@@ -294,6 +385,7 @@ class GeneNameCleaner:
             cleaned_gene += "_" + anticodon
 
         return cleaned_gene
+
     def clean_rrna_gene(self, gene: Optional[str]) -> Optional[str]:
         """Standardizes recognized plastid rRNA names to their canonical gene names."""
         if not gene:
@@ -352,6 +444,12 @@ class PlastidFeature:
         """
         self._exception = None
         self.seq_obj = None
+        self._parent_len = (
+            len(record.seq)
+            if record is not None and getattr(record, "seq", None) is not None
+            else 0
+        )
+        self._topology = record_topology(record)
 
         self._set_feat_name(feature)
         self._set_rec_name(record)
@@ -369,13 +467,38 @@ class PlastidFeature:
         self.feature = feature
 
     def _set_seq_obj(self, record: SeqRecord):
+        if self.feature is None:
+            self._set_exception(ValueError("invalid or inverted feature coordinates"))
+            return
         try:
-            self.seq_obj = self.feature.extract(record).seq
+            seq = self.feature.extract(record).seq
+            bad = _INVALID_RESIDUES.search(str(seq))
+            if bad:
+                raise ValueError(
+                    f"invalid nucleotide character {bad.group()!r} at position"
+                    f" {bad.start() + 1} of the feature"
+                )
+            if self._parent_len > 0 and len(seq) > self._parent_len:
+                raise ValueError(
+                    f"extracted feature length ({len(seq)} bp) exceeds parent genome ({self._parent_len} bp)"
+                )
+            self.seq_obj = seq
         except Exception as e:
             self._set_exception(e)
 
     def _set_seq_name(self):
         self.seq_name = f"{self.feat_name}_{self.rec_name}"
+        if (
+            isinstance(self.feat_name, str)
+            and len(self.feat_name) > MAX_REGION_NAME_CHARS
+        ):
+            self.seq_obj = None
+            self._set_exception(
+                ValueError(
+                    f"region name of {len(self.feat_name)} characters exceeds the"
+                    f" {MAX_REGION_NAME_CHARS} character limit"
+                )
+            )
 
     def _set_exception(self, exception: Exception | None = None):
         if exception is None:
@@ -393,8 +516,12 @@ class PlastidFeature:
             A string describing the `SeqRecord` status.
 
         """
-        message = f"skipped due to {self._exception}" if self._exception else "successful"
-        status = f"parsing of {self._type} '{self.feat_name}' in {self.rec_name} {message}"
+        message = (
+            f"skipped due to {self._exception}" if self._exception else "successful"
+        )
+        status = (
+            f"parsing of {self._type} '{self.feat_name}' in {self.rec_name} {message}"
+        )
         return status
 
     def log_exception(self):
@@ -442,6 +569,8 @@ class GeneFeature(PlastidFeature):
         """
         Accesses if a proper reading frame exists for the gene.
         """
+        if self.seq_obj is None:  # extraction failed; the exception is recorded
+            return
         trim_char = len(self.seq_obj) % 3
         if trim_char > 0 and self.seq_obj[:3] == "ATG":
             self.seq_obj = self.seq_obj[:-trim_char]
@@ -456,7 +585,10 @@ class ProteinFeature(GeneFeature):
     _default_exception = "potential reading frame error of this feature in input file"
 
     def __init__(
-        self, record: SeqRecord = None, feature: SeqFeature = None, gene: GeneFeature = None
+        self,
+        record: SeqRecord = None,
+        feature: SeqFeature = None,
+        gene: GeneFeature = None,
     ):
         """
         Primarily a wrapper for a protein `SeqRecord` that can be accessed by `get_record()`.
@@ -485,7 +617,9 @@ class ProteinFeature(GeneFeature):
             return
 
         try:
-            self.seq_obj = self.seq_obj.translate(table=11)  # Getting error TTA is not stop codon.
+            self.seq_obj = self.seq_obj.translate(
+                table=11
+            )  # Getting error TTA is not stop codon.
         except Exception as e:
             self._set_exception(e)
 
@@ -514,19 +648,20 @@ class IntronFeature(PlastidFeature):
         super()._set_feature(feature)
         exon_1 = self.feature.location.parts[self.offset]
         exon_2 = self.feature.location.parts[self.offset + 1]
-        in_order = exon_2.start >= exon_1.end
-
-        if in_order:
-            self.feature.location = FeatureLocation(exon_1.end, exon_2.start)
-        else:
-            self.feature.location = FeatureLocation(exon_2.start, exon_1.end)
+        loc = circular_intron_bounds(exon_1, exon_2, self._parent_len, self._topology)
+        if loc is None:
+            self.feature = None
+            return
+        self.feature.location = loc
 
 
 class IntergenicFeature(PlastidFeature):
     _type = "intergenic spacer"
     _default_exception = "negative intergenic length in input file"
 
-    def __init__(self, record: SeqRecord, current_feat: SeqFeature, subsequent_feat: SeqFeature):
+    def __init__(
+        self, record: SeqRecord, current_feat: SeqFeature, subsequent_feat: SeqFeature
+    ):
         """
         Primarily a wrapper for an intergenic spacer `SeqRecord` that can be accessed by `get_record()`.
         It contains other variables and methods that document the creation of the `SeqRecord`.
@@ -548,7 +683,9 @@ class IntergenicFeature(PlastidFeature):
         self.start_pos = ExactPosition(current_feat.location.end)  # +1)
         self.end_pos = ExactPosition(self.subsequent_feat.location.start)
         self.feature = (
-            FeatureLocation(self.start_pos, self.end_pos) if self.start_pos < self.end_pos else None
+            FeatureLocation(self.start_pos, self.end_pos)
+            if self.start_pos < self.end_pos
+            else None
         )
         self.default_exception = (
             f"{IntergenicFeature._default_exception}"

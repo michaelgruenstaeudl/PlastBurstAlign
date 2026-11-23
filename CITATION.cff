@@ -1,0 +1,51 @@
+cff-version: 1.2.0
+message: "If you use PlastBurstAlign in your research, please cite it using the metadata in this file."
+title: "PlastBurstAlign"
+abstract: >-
+  PlastBurstAlign extracts genes, introns, intergenic spacers and RNA genes
+  from hundreds to thousands of plastid genomes in GenBank flat-file format,
+  aligns each homologous region in parallel with MAFFT, MUSCLE or Clustal
+  Omega (or a built-in fallback aligner) and concatenates the alignments into
+  a partitioned supermatrix, within bounded memory.
+type: software
+version: 3.0.0rc1
+license: BSD-3-Clause
+repository-code: "https://github.com/michaelgruenstaeudl/PlastBurstAlign"
+url: "https://gruenstaeudl-lab.com/"
+keywords:
+  - bioinformatics
+  - plastid genome
+  - plastome
+  - multiple sequence alignment
+  - supermatrix
+  - phylogenomics
+authors:
+  - family-names: Hamitouche
+    given-names: Thanina
+    email: t_hamitouche@mail.fhsu.edu
+  - family-names: Gruenstaeudl
+    given-names: Michael
+    email: m_gruenstaeudl@fhsu.edu
+    # TODO(maintainers): add `orcid:` and `affiliation:` for every author.
+
+# TODO(maintainers): set the release date when v3.0.0 is tagged, e.g.
+# date-released: "2026-12-31"
+
+# TODO(maintainers): after the first Zenodo software archive of a release
+# exists, add its DOI here. Use the *concept* DOI (it always resolves to the
+# latest version) and do not invent or guess it:
+# doi: "10.5281/zenodo.XXXXXXX"
+
+# TODO(maintainers): if a paper describing PlastBurstAlign is published, add it
+# as `preferred-citation:` (type: article, authors, title, journal, year, doi)
+# so that GitHub's "Cite this repository" button points to the paper.
+
+references:
+  - type: dataset
+    title: "Benchmarking data sets for software 'plastburstalign'"
+    doi: "10.5281/zenodo.17137737"
+    url: "https://zenodo.org/records/17137737"
+    authors:
+      - family-names: Gruenstaeudl
+        given-names: Michael
+    # The datasets are described in benchmarking/plastbench/datasets.json.

@@ -1,0 +1,2 @@
+Name:	python
+Cpus_allowed_list:	0-3

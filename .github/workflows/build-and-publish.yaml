@@ -1,4 +1,17 @@
 # Workflow derived from https://packaging.python.org/en/latest/guides/publishing-package-distribution-releases-using-github-actions-ci-cd-workflows/
+#
+# Publishing is gated on the test workflow: the `tests` job below calls the
+# reusable CI workflow (.github/workflows/ci.yml, `workflow_call`) for exactly
+# the commit being published, and `build` -> `publish-to-pypi` ->
+# `github-release` only run if every lint, test and packaging job passed.
+#
+# One-time setup (maintainers):
+#   * PyPI: add a "trusted publisher" for this repository, workflow file
+#     `build-and-publish.yaml`, environment `pypi`
+#     (https://pypi.org/manage/project/plastburstalign/settings/publishing/).
+#   * GitHub: create the `pypi` environment (optionally with required reviewers).
+#   * Bump `version` in pyproject.toml and merge to main: that push triggers this
+#     workflow (pre-releases such as 3.0.0rc1 are published as GitHub pre-releases).
 
 on:
   push:
@@ -10,32 +23,53 @@ on:
 
 name: build-and-publish
 
+permissions:
+  contents: read
+
+concurrency:
+  group: build-and-publish-${{ github.ref }}
+  cancel-in-progress: false
+
 
 jobs:
+  tests:
+    name: Tests must pass before publishing
+    if: github.repository == 'michaelgruenstaeudl/PlastBurstAlign'
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
   build:
     name: Build distribution 📦
+    needs:
+      - tests
     if: github.repository == 'michaelgruenstaeudl/PlastBurstAlign'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
-          python-version: "3.9"
+          python-version: "3.12"
 
-      - name: Install pypa/build
+      - name: Install pypa/build and twine
         run: >-
           python3 -m
           pip install
           build
+          twine
           --user
 
       - name: Build a binary wheel and a source tarball
         run: python3 -m build
 
+      - name: Check the distribution metadata
+        run: python3 -m twine check --strict dist/*
+
       - name: Store the distribution packages
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: python-package-distributions
           path: dist/
@@ -47,6 +81,7 @@ jobs:
     needs:
       - build
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     environment:
       name: pypi
       url: https://pypi.org/p/plastburstalign
@@ -55,7 +90,7 @@ jobs:
 
     steps:
       - name: Download all the dists
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: python-package-distributions
           path: dist/
@@ -71,6 +106,7 @@ jobs:
     needs:
       - publish-to-pypi
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     permissions:
       contents: write  # IMPORTANT: mandatory for making GitHub Releases
@@ -78,7 +114,7 @@ jobs:
 
     steps:
       - name: Download all the dists
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: python-package-distributions
           path: dist/
@@ -92,14 +128,22 @@ jobs:
 
       - name: Extract package name and version
         run: |
-          # Extract the first .whl file name
+          # Wheel file names are `<name>-<version>-<tags>.whl` and neither the
+          # (normalized) name nor a PEP 440 version contains a hyphen. This also
+          # works for pre-releases such as 3.0.0rc1.
           FILE=$(ls dist/*.whl | head -n 1)
-          # Extract package name and version from the filename
-          PACKAGE_NAME=$(basename $FILE | sed -n 's/^\(.*\)-\([0-9]\+\(\.[0-9]\+\)*\)-.*/\1/p')
-          PACKAGE_VERSION=$(basename $FILE | sed -n 's/^\(.*\)-\([0-9]\+\(\.[0-9]\+\)*\)-.*/\2/p')
+          BASE=$(basename "$FILE")
+          PACKAGE_NAME=$(echo "$BASE" | cut -d- -f1)
+          PACKAGE_VERSION=$(echo "$BASE" | cut -d- -f2)
           # Set output variables for GitHub Actions
           echo "package_name=$PACKAGE_NAME" >> $GITHUB_ENV
           echo "package_version=$PACKAGE_VERSION" >> $GITHUB_ENV
+          # a/b/rc/dev/post markers => mark the GitHub release as a pre-release
+          if echo "$PACKAGE_VERSION" | grep -Eq '^[0-9]+(\.[0-9]+)*$'; then
+            echo "release_flags=" >> $GITHUB_ENV
+          else
+            echo "release_flags=--prerelease" >> $GITHUB_ENV
+          fi
 
       - name: Create GitHub Release
         env:
@@ -107,6 +151,7 @@ jobs:
         run: >-
           gh release create
           '${{ env.package_name }}-${{ env.package_version }}'
+          ${{ env.release_flags }}
           --repo '${{ github.repository }}'
           --notes ""
 

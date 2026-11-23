@@ -1,18 +1,58 @@
-*.egg-info/
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*.egg-info/
+.eggs/
 build/
 dist/
+.venv/
+venv/
 _devel/*
+
+# Tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Coverage (pytest-cov / coverage.py; `parallel = true` writes .coverage.<host>.<pid>.<rand>)
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
 # Local scratchpad and benchmarks
 sandbox/
-.pytest_cache/
-*.egg-info/
-.coverage
 
 # Benchmarking artifacts and test runs
 benchmarking/*_output_*
 benchmarking/*.tar.gz
 benchmarking/benchmark_*
-.coverage
-sandbox/
+benchmarking/*.log
+
+# PlastBench local state (datasets, work dirs, results, badge files)
+benchmarking/plastbench/data/
+benchmarking/plastbench/work/
+benchmarking/plastbench/results/
+benchmarking/plastbench/badges/
+plastbench_data/
+plastbench_results*.json
+
+# Tracked golden files of the parity gate must never be ignored
+!tests/golden/
+!tests/golden/**
+
+# Local benchmarking and scratch output
+test_run_*/
+benchmark_results_*
+*.db
+*.db-wal
+*.db-shm
+*_metrics.csv
+
+# Cluster batch scripts and SLURM logs
+*.slurm
+*.err
+*.log
+slurm-*.out
+slurm_*.out
+slurm_logs/

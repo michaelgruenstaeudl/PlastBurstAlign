@@ -34,8 +34,8 @@ verbose: false
 # Output order: 'seq' or 'alpha'
 order: "seq"
 
-# Enable concatenation
-concat: false
+# # Enable concatenation
+concat: False
 
 #------------------------------------------------------------------------------------------------------------------------------
 
@@ -43,9 +43,10 @@ concat: false
 
 # For mafft:
 # alignment_tool: "mafft"
-# # alignment_tool_path: "/path/to/mafft"
-#   # MAFFT options
-#   threads: 4 # Number of threads (or "auto")
+# alignment_tool_path: "/path/to/mafft"
+# alignment_tool_config:
+  # MAFFT options
+  # threads: 4 # Number of threads (or "auto")
 #   algorithm: "auto"  # Options: auto, localpair, globalpair, genafpair, retree, maxiterate
 #   adjustdirection: true
 #   quiet: false
@@ -60,10 +61,10 @@ concat: false
 # # alignment_tool_path: "/path/to/clustalo"
 # alignment_tool_config:
 #   iterations: 0  # HMM iterations (0 = default)
-#   threads: 4 # Number of threads 
+#   threads: 4 # Number of threads
 #   outfmt: "fasta"  # Output format: fasta, clustal, msf, phylip, selex, vienna
 #   verbose: false,
-#   dealign: false 
+#   dealign: false
 
 #------------------------------------------------------------------------------------------------------------------------------
 
@@ -97,11 +98,11 @@ concat: false
 #   input_flag: "-super5"          # or the input switch your aligner uses
 #   output_flag: "-output"         # or the output switch your aligner uses
 #   extra_args:
-#       perm: "abc"         
-#       perturb: 0 
+#       perm: "abc"
+#       perturb: 0
 
 
-# Exemple with command_template using muscle: 
+# Exemple with command_template using muscle:
 # alignment_tool: "generic"
 # alignment_tool_path: "/home/t_hamitouche/anaconda3/envs/plastburstalign/bin/muscle"
 # alignment_tool_config:
@@ -134,5 +135,3 @@ concat: false
 # alignment_tool_config:
 #   input_flag: "-infile"          # or the input switch your aligner uses
 #   output_flag: "-outfile"         # or the output switch your aligner uses
-
-

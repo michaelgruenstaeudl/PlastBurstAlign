@@ -1,0 +1,5 @@
+12:memory:/docker/abc123def
+11:cpu,cpuacct:/docker/abc123def
+10:cpuset:/docker/abc123def
+9:pids:/docker/abc123def
+1:name=systemd:/docker/abc123def

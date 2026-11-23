@@ -1,0 +1,4 @@
+1000 900 0:100 / / rw,relatime master:1 - overlay overlay rw,lowerdir=/l,upperdir=/u,workdir=/w
+1001 1000 0:101 / /dev/shm rw,nosuid,nodev,noexec,relatime - tmpfs shm rw,size=65536k
+1002 1000 0:102 / /proc/acpi ro,relatime - tmpfs tmpfs ro
+1003 1000 0:103 / /data rw,relatime - nfs4 nas:/export/data rw,vers=4.1
