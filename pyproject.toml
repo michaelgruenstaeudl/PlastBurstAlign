@@ -12,7 +12,7 @@ authors = [
     {name = "Thanina Hamitouche", email = "t_hamitouche@mail.fhsu.edu"},
     {name = "Michael Gruenstaeudl, PhD", email = "m_gruenstaeudl@fhsu.edu"}
 ]
-version = "3.0.0rc1"
+version = "1.5"
 
 readme = "README.md"
 license = "BSD-3-Clause"
