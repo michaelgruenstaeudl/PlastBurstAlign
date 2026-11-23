@@ -34,8 +34,8 @@ verbose: false
 # Output order: 'seq' or 'alpha'
 order: "seq"
 
-# Enable concatenation
-concat: false
+# # Enable concatenation
+concat: False
 
 #------------------------------------------------------------------------------------------------------------------------------
 
@@ -43,9 +43,10 @@ concat: false
 
 # For mafft:
 # alignment_tool: "mafft"
-# # alignment_tool_path: "/path/to/mafft"
-#   # MAFFT options
-#   threads: 4 # Number of threads (or "auto")
+# alignment_tool_path: "/path/to/mafft"
+# alignment_tool_config:
+  # MAFFT options
+  # threads: 4 # Number of threads (or "auto")
 #   algorithm: "auto"  # Options: auto, localpair, globalpair, genafpair, retree, maxiterate
 #   adjustdirection: true
 #   quiet: false

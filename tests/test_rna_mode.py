@@ -136,6 +136,27 @@ class RNAModeTests(unittest.TestCase):
         self.assertIs(params["select_mode"], SelectMode.RNA)
         self.assertIn("rna", UserParametersScript._get_parser().format_help())
 
+    def test_concat_cli_precedence_over_config(self):
+        config = self.root / "config.yaml"
+        config.write_text("concat: true\n", encoding="ascii")
+        base_args = [
+            "plastburstalign",
+            "-i",
+            str(self.input_dir),
+            "-o",
+            str(self.root / "output"),
+            "--config",
+            str(config),
+        ]
+
+        with patch.object(sys, "argv", base_args):
+            params = UserParametersScript()
+        self.assertTrue(params["concat"])
+
+        with patch.object(sys, "argv", base_args + ["--no-concat"]):
+            params = UserParametersScript()
+        self.assertFalse(params["concat"])
+
     def test_extracts_untrimmed_strand_correct_spliced_rnas(self):
         data, _ = self.extract_record()
         self.assertIsNone(data.proteins)

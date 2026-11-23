@@ -563,9 +563,9 @@ class UserParametersScript(UserParameters):
         parser.add_argument(
             "--concat",
             "-c",
-            action="store_true",
+            action=argparse.BooleanOptionalAction,
+            default=argparse.SUPPRESS,
             required=False,
-            # help="(Optional) Enable sequential writing of alignment concatenation"
             help="(Optional) Enable concatenation of individual alignments and writing of concatenation file to disk",
         )
         parser.add_argument(

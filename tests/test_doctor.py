@@ -192,13 +192,19 @@ class TestMain(_DoctorCase):
         return code, buf.getvalue()
 
     def _no_aligners_env(self) -> "contextlib.AbstractContextManager[object]":
-        """Process env without aligners, even if CI exported the builtin switch."""
-        stack = contextlib.ExitStack()
-        stack.enter_context(
-            mock.patch.dict("os.environ", {"PATH": str(self.tmp / "emptybin")})
-        )
-        os.environ.pop("PBA_FORCE_BUILTIN_ALIGNER", None)
-        return stack
+        """Simulate an environment without external aligners."""
+        env = os.environ.copy()
+
+        env["PATH"] = str(self.tmp / "emptybin")
+
+        # Prevent detection of aligners installed through Conda
+        env.pop("CONDA_PREFIX", None)
+        env.pop("CONDA_DEFAULT_ENV", None)
+
+        # Disable any forced built-in aligner setting
+        env.pop("PBA_FORCE_BUILTIN_ALIGNER", None)
+
+        return mock.patch.dict("os.environ", env, clear=True)
 
     def test_text_output_and_exit_code_with_builtin_only(self) -> None:
         empty = self.tmp / "emptyroot"

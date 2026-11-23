@@ -929,12 +929,20 @@ class TestLegacyManagerCompatibility(TmpCase):
 
     def test_positional_arguments_and_custom_dir(self):
         custom = self.mkdir("custom")
-        with EphemeralScratchManager(custom, 123) as mgr:
+
+        env = Host().env(
+            mounts=mountinfo((str(custom), "ext4")),
+            env={},
+            temp_dir=str(self.tmp),
+        )
+
+        with EphemeralScratchManager(custom, 123, environment=env) as mgr:
             self.assertEqual(mgr.min_headroom_bytes, 123)
             self.assertEqual(mgr.path.parent, custom)
             self.assertTrue(mgr.path.name.startswith(f"pba_{os.getpid()}_"))
             self.assertFalse(mgr.is_ramdisk)
-        self.assertFalse(mgr.scratch_path.exists())  # type: ignore[union-attr]
+
+        self.assertFalse(mgr.scratch_path.exists())
 
     def test_custom_dir_on_tmpfs_reports_ramdisk(self):
         shm = self.mkdir("fake_tmpfs")
